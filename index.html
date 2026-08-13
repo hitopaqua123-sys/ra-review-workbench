@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>海外测评合作工作台 · Review Admin</title>
+  <meta name="theme-color" content="#FFD600" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="测评工作台" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <link rel="icon" type="image/png" href="icon-192.png" />
+  <!-- iOS launch splash (apple-touch-startup-image) -->
+  <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3)" href="splash-1125x2436.png" />
+  <link rel="apple-touch-startup-image" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3)" href="splash-1170x2532.png" />
+  <link rel="apple-touch-startup-image" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3)" href="splash-1284x2778.png" />
+  <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3)" href="splash-1242x2688.png" />
+  <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2)" href="splash-828x1792.png" />
+  <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2)" href="splash-750x1334.png" />
+  <link rel="stylesheet" href="vendor/fonts/fonts.css" />
+  <link rel="stylesheet" href="styles.css?v=20260813c" />
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">RA</div>
+        <div class="brand-text">
+          <div class="brand-title">海外测评合作工作台</div>
+          <div class="brand-sub">Review Admin</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-view="dashboard">
+          <span class="nav-ico">▦</span><span>数据仪表盘</span>
+        </button>
+        <button class="nav-item" data-view="customers">
+          <span class="nav-ico">☺</span><span>客户管理</span>
+        </button>
+        <button class="nav-item" data-view="orders">
+          <span class="nav-ico">▤</span><span>订单管理</span>
+        </button>
+        <button class="nav-item" data-view="comments">
+          <span class="nav-ico">💬</span><span>客户评论管理</span>
+        </button>
+        <button class="nav-item" data-view="settlements">
+          <span class="nav-ico">▣</span><span>结算管理</span>
+        </button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="tiny muted" style="padding:6px 8px">数据保存在本机浏览器</span>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-controls">
+          <button class="btn btn-sm" id="btn-back" style="display:none" title="后退：关闭最近一个弹窗">↩ 后退 (<span id="back-count">0</span>)</button>
+          <button class="btn btn-sm btn-danger" id="btn-close-all" style="display:none" title="关闭全部右侧弹窗">✕ 关闭全部 (<span id="close-all-count">0</span>)</button>
+        </div>
+        <div class="topbar-title" id="view-title">数据仪表盘</div>
+        <div class="topbar-actions">
+          <span class="env-tag">本地版 · 数据存于本机浏览器</span>
+          <div class="topbar-pill">
+            <div class="topbar-ico" title="通知">🔔</div>
+            <div class="topbar-ico" title="消息">💬</div>
+            <div class="topbar-avatar" title="Anna">A</div>
+          </div>
+        </div>
+      </header>
+      <section class="content" id="content"><!-- views render here --></section>
+    </main>
+  </div>
+
+  <!-- Modal root -->
+  <div id="modal-root"></div>
+  <div id="float-root"></div>
+  <div id="toast-root"></div>
+
+  <script src="vendor/chart.umd.min.js"></script>
+  <script src="vendor/xlsx.full.min.js"></script>
+  <script src="vendor/fflate.umd.min.js"></script>
+  <script src="seed_data.js?v=20260812a"></script>
+  <script src="app.js?v=20260813a"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function (err) {
+          console.warn('SW register failed:', err);
+        });
+      });
+    }
+  </script>
+</body>
+</html>

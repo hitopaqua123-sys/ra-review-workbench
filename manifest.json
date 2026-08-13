@@ -1,0 +1,20 @@
+{
+  "id": "./",
+  "name": "海外测评合作工作台 · Review Admin",
+  "short_name": "测评工作台",
+  "description": "IBAY Aqua 海外 KOL 测评合作与订单结算管理（本地数据，离线可用）",
+  "lang": "zh-CN",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#FFD600",
+  "theme_color": "#FFD600",
+  "categories": ["business", "productivity"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
