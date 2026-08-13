@@ -1,6 +1,6 @@
 // Service Worker — app shell offline cache for PWA
 // offline-first: navigation -> cached app shell; static assets -> cache-first (stale-while-revalidate)
-const CACHE = 'review-admin-v21';
+const CACHE = 'review-admin-v22';
 const SHELL = [
   './',
   'index.html',
@@ -45,6 +45,10 @@ self.addEventListener('activate', (e) => {
       .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
+});
+
+self.addEventListener('message', (e) => {
+  if (e.data === 'skipWaiting') self.skipWaiting();
 });
 
 self.addEventListener('fetch', (e) => {
