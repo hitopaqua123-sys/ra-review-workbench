@@ -13,6 +13,22 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':
 const fmtMoney = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
+
+/* ---------- force horizontal scroll on all tables ---------- */
+function forceTableScroll(root = document) {
+  const content = $('#content');
+  if (content) { content.style.overflowY = 'auto'; content.style.overflowX = 'hidden'; }
+  $$('.table-wrap', root).forEach((wrap) => {
+    wrap.style.overflowX = 'auto';
+    wrap.style.overflowY = 'visible';
+    wrap.style.display = 'block';
+    wrap.style.maxWidth = '100%';
+  });
+  $$('table.data', root).forEach((tbl) => {
+    tbl.style.width = 'max-content';
+    tbl.style.minWidth = '0';
+  });
+}
 function toast(msg, type = '') {
   const root = $('#toast-root');
   const t = document.createElement('div');
@@ -1455,6 +1471,7 @@ async function renderCustomers(c, keepScroll = false) {
   const clearAll = $('[data-clear-all]', c);
   if (clearAll) clearAll.addEventListener('click', () => { clearAllTableFilters(clearAll.dataset.tableKey); renderCustomers(c); });
   if (!keepScroll) c.scrollTop = 0;
+  forceTableScroll(c);
   restoreFocus(_focusSnap);
 }
 
@@ -2052,6 +2069,7 @@ async function renderOrders(c, keepScroll = false) {
   const clearAll = $('[data-clear-all]', c);
   if (clearAll) clearAll.addEventListener('click', () => { clearAllTableFilters(clearAll.dataset.tableKey); renderOrders(c); });
   if (!keepScroll) c.scrollTop = 0;
+  forceTableScroll(c);
   restoreFocus(_focusSnap);
 }
 function renderEmptyOrders(c) {
@@ -2408,6 +2426,7 @@ async function renderSettlements(c) {
   bindDropdownCells(c, () => renderSettlements(c));
   $$('[data-col][data-table-key]', c).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); clearColFilter(b.dataset.tableKey, b.dataset.col); renderSettlements(c); }));
   $$('[data-clear-all]', c).forEach((b) => b.addEventListener('click', () => { clearAllTableFilters(b.dataset.tableKey); renderSettlements(c); }));
+  forceTableScroll(c);
 }
 
 /* ============================================================
@@ -2582,6 +2601,7 @@ async function renderComments(c, keepScroll = false) {
   const clearAll = $('[data-clear-all]', c);
   if (clearAll) clearAll.addEventListener('click', () => { clearAllTableFilters(clearAll.dataset.tableKey); renderComments(c); });
   if (!keepScroll) c.scrollTop = 0;
+  forceTableScroll(c);
   restoreFocus(_focusSnap);
 }
 
