@@ -18,11 +18,12 @@ const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 function forceTableScroll(root = document) {
   const content = $('#content');
   if (content) { content.style.overflowY = 'auto'; content.style.overflowX = 'hidden'; }
+  /* 关键修复：解除 .maxw 的宽度限制，让表格可以撑开并触发横向滚动 */
+  $$('.maxw', root).forEach((m) => { m.style.maxWidth = 'none'; });
   $$('.table-wrap', root).forEach((wrap) => {
     wrap.style.overflowX = 'auto';
     wrap.style.overflowY = 'visible';
     wrap.style.display = 'block';
-    wrap.style.maxWidth = '100%';
   });
   $$('table.data', root).forEach((tbl) => {
     tbl.style.width = 'max-content';
