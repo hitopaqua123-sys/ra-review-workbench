@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814g';
+const APP_VERSION = '20260814h';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -3953,7 +3953,7 @@ async function init() {
    口令以 SHA-256 哈希存储于 ACCESS_HASH，源码不含明文口令。
    配合私有仓库使用：源码不公开 → 哈希不可见 → 安全。
    ============================================================ */
-const ACCESS_HASH = '2def0f798071f72ba675222e71c8a7cd4f10785b9b6fa3b6af509155cd8bc0f5';
+const ACCESS_HASH = 'ef5860dead978df958178b2e84b4f5e871fb302751bc2811dc9070fda977e5ff';
 const ACCESS_HINT = '请输入团队访问口令（仅授权人员可进入）';
 
 async function sha256Hex(str) {
