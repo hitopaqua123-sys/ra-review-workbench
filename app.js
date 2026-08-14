@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814f';
+const APP_VERSION = '20260814g';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -3948,5 +3948,75 @@ async function init() {
   migrateComments();
   navigate('dashboard');
 }
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-else init();
+/* ============================================================
+   访问口令门（仅指定的人能打开网站）
+   口令以 SHA-256 哈希存储于 ACCESS_HASH，源码不含明文口令。
+   配合私有仓库使用：源码不公开 → 哈希不可见 → 安全。
+   ============================================================ */
+const ACCESS_HASH = '2def0f798071f72ba675222e71c8a7cd4f10785b9b6fa3b6af509155cd8bc0f5';
+const ACCESS_HINT = '请输入团队访问口令（仅授权人员可进入）';
+
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+function injectGateStyles() {
+  if (document.getElementById('access-gate-style')) return;
+  const s = document.createElement('style');
+  s.id = 'access-gate-style';
+  s.textContent = `
+  .access-gate{position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0f172a,#1e293b);font-family:system-ui,-apple-system,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif}
+  .access-card{background:#fff;border-radius:14px;padding:32px 28px;width:340px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.35);text-align:center}
+  .access-card h2{margin:0 0 6px;font-size:20px;color:#0f172a}
+  .access-card .sub{color:#64748b;font-size:13px;margin:0 0 18px}
+  .access-card input{width:100%;box-sizing:border-box;padding:11px 12px;font-size:15px;border:1px solid #d1d5db;border-radius:9px;margin-bottom:12px;outline:none}
+  .access-card input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .access-card .btn{width:100%}
+  .access-err{color:#dc2626;font-size:13px;margin:10px 0 0;min-height:18px}
+  `;
+  document.head.appendChild(s);
+}
+function buildGate() {
+  injectGateStyles();
+  const gate = document.createElement('div');
+  gate.id = 'access-gate';
+  gate.className = 'access-gate';
+  gate.innerHTML = `
+    <div class="access-card">
+      <h2>🔒 受限访问</h2>
+      <p class="sub">${ACCESS_HINT}</p>
+      <input type="password" id="access-pwd" placeholder="请输入访问口令" autocomplete="off">
+      <button class="btn btn-primary" id="access-btn">进入工作台</button>
+      <p class="access-err" id="access-err"></p>
+    </div>`;
+  document.body.appendChild(gate);
+  const pwd = gate.querySelector('#access-pwd');
+  const btn = gate.querySelector('#access-btn');
+  const err = gate.querySelector('#access-err');
+  const tryOpen = async () => {
+    const v = pwd.value;
+    if (!v) { err.textContent = '请输入口令'; return; }
+    if (!crypto.subtle) { err.textContent = '当前环境不支持安全校验，请通过 https 访问'; return; }
+    const h = await sha256Hex(v);
+    if (h === ACCESS_HASH) {
+      try { sessionStorage.setItem('app_access_ok', '1'); } catch (e) {}
+      gate.remove();
+      runApp();
+    } else {
+      err.textContent = '口令错误，请重试';
+      pwd.value = ''; pwd.focus();
+    }
+  };
+  btn.addEventListener('click', tryOpen);
+  pwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryOpen(); });
+  setTimeout(() => pwd.focus(), 50);
+}
+function runApp() {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+}
+(function boot() {
+  try { if (sessionStorage.getItem('app_access_ok') === '1') { runApp(); return; } } catch (e) {}
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', buildGate);
+  else buildGate();
+})();
