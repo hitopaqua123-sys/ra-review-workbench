@@ -2220,6 +2220,8 @@ async function openOrderForm(id, prefill = null) {
       if (originalOrder && originalOrder.customerId && originalOrder.customerId !== rec.customerId) {
         await recomputeCustomerStatsById(originalOrder.customerId);
       }
+      // 跨模块联动：订单评论字段 -> 客户评论管理（按订单号同步/新建）
+      await syncOrderReviewToComments(rec);
       renderCustomersIfVisible(true);
       m.close(); toast(isEdit ? '已更新' : '已新增', 'success'); render();
     } catch (err) {
@@ -2297,7 +2299,7 @@ async function openOrderDetail(id) {
     tabs: [{ label: '详情', html: body }, { label: '评论管理', html: cmPaneHtml }],
     onReady: (panel, close) => {
       bindImagesEdit(panel, o, 'orders', 'reviewImages', () => { close(); openOrderDetail(id); });
-      bindInlineEdit(panel, o, 'orders', defs, { onSave: async (rec) => { await recomputeCustomerStatsForOrder(rec); renderCustomersIfVisible(true); } });
+      bindInlineEdit(panel, o, 'orders', defs, { onSave: async (rec) => { await recomputeCustomerStatsForOrder(rec); await syncOrderReviewToComments(rec); renderCustomersIfVisible(true); } });
       if (linkedCustomer) {
         $('#d-view-cust', panel).addEventListener('click', () => openCustomerFloat(linkedCustomer.id));
         $('#d-new-order', panel).addEventListener('click', () => openOrderForm(null, linkedCustomer));
@@ -2713,7 +2715,9 @@ async function openCommentForm(id) {
     };
 
     await putOne('comments', recData);
-    // also sync comment into order's comments[] array
+    // 跨模块联动：评论 -> 对应订单（回写评论内容/截图/提交时间到订单顶层字段）
+    await syncCommentReviewToOrder(recData);
+    // also sync comment into order's comments[] array (保留既有聚合逻辑)
     if (matchedOrder) {
       if (!Array.isArray(matchedOrder.comments)) matchedOrder.comments = [];
       const exists = matchedOrder.comments.findIndex((c) => c.id === recData.id);
@@ -3252,6 +3256,93 @@ function syncCommentMirrors(rec, store) {
   rec.reviewSubmitDate = submitDate;
   // 注意：保留 reviewScreenshotUrl / transferScreenshotUrl 等既有字段，不覆盖
   return putOne(store, rec);
+}
+
+/* ---------- 跨模块双向联动：订单 <-> 客户评论管理 (v20260814c) ---------- */
+
+// 方向1：订单保存后，把订单的评论字段同步到 comments store（按订单号匹配）
+// 存在对应评论则更新（仅更新最近一条，避免误改多条手动评论）；不存在且订单含评论数据则自动新建
+async function syncOrderReviewToComments(order) {
+  if (!order) return;
+  const onum = String(order.orderNumber || '').trim().toLowerCase();
+  if (!onum) return;
+  const hasReviewData = Boolean(
+    (order.reviewContent && String(order.reviewContent).trim()) ||
+    (Array.isArray(order.reviewImages) && order.reviewImages.length) ||
+    order.reviewSubmitDate
+  );
+  const allComments = await getAll('comments');
+  const matched = allComments
+    .filter((c) => c.orderNumber && String(c.orderNumber).trim().toLowerCase() === onum)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+
+  if (matched.length) {
+    // 仅更新最近一条，保留其他（如手动多条）评论不被覆盖
+    const target = matched[0];
+    target.reviewContent = order.reviewContent || '';
+    target.images = Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [];
+    target.reviewSubmitDate = order.reviewSubmitDate || null;
+    if (order.customerName) target.customerName = order.customerName;
+    if (order.customerEmail) target.customerEmail = order.customerEmail;
+    if (order.product) target.product = order.product;
+    if (order.store) target.store = order.store;
+    target.orderId = order.id;
+    target.updatedAt = new Date().toISOString();
+    await putOne('comments', target);
+    // 同步更新订单内嵌 comments[] 镜像，保持详情页"评论管理"标签一致
+    if (!Array.isArray(order.comments)) order.comments = [];
+    const mi = order.comments.findIndex((c) => c.id === target.id);
+    const mirror = { id: target.id, content: target.reviewContent, images: target.images, submitDate: target.reviewSubmitDate, source: 'order_sync' };
+    if (mi >= 0) order.comments[mi] = mirror; else order.comments.push(mirror);
+    await putOne('orders', order);
+    return;
+  }
+
+  if (!hasReviewData) return; // 订单无评论数据则不新建空评论
+
+  // 不存在对应评论 -> 自动新建一条评论记录
+  const now = new Date().toISOString();
+  const recData = {
+    id: uid(),
+    orderNumber: order.orderNumber,
+    orderId: order.id,
+    customerName: order.customerName || '',
+    customerEmail: order.customerEmail || '',
+    product: order.product || '',
+    store: order.store || '',
+    sourceTag: '',
+    reviewStatus: 'reviewed',
+    rating: null,
+    reviewSubmitDate: order.reviewSubmitDate || null,
+    reviewContent: order.reviewContent || '',
+    feedback: '',
+    images: Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  await putOne('comments', recData);
+  if (!Array.isArray(order.comments)) order.comments = [];
+  order.comments.push({ id: recData.id, content: recData.reviewContent, images: recData.images, submitDate: recData.reviewSubmitDate, source: 'order_sync' });
+  await putOne('orders', order);
+}
+
+// 方向2：评论保存后，把评论信息回写到对应订单的顶层评论字段
+async function syncCommentReviewToOrder(comment) {
+  if (!comment) return;
+  const orders = await getAll('orders');
+  const ord = comment.orderId
+    ? orders.find((o) => o.id === comment.orderId)
+    : orders.find((o) => o.orderNumber && String(o.orderNumber).trim().toLowerCase() === String(comment.orderNumber || '').trim().toLowerCase());
+  if (!ord) return;
+  ord.reviewContent = comment.reviewContent || '';
+  ord.reviewImages = Array.isArray(comment.images) ? comment.images.slice() : [];
+  ord.reviewSubmitDate = comment.reviewSubmitDate || null;
+  // 同步更新订单内嵌 comments[] 镜像
+  if (!Array.isArray(ord.comments)) ord.comments = [];
+  const mi = ord.comments.findIndex((c) => c.id === comment.id);
+  const mirror = { id: comment.id, content: comment.reviewContent, images: comment.images, submitDate: comment.reviewSubmitDate, source: 'comments_page' };
+  if (mi >= 0) ord.comments[mi] = mirror; else ord.comments.push(mirror);
+  await putOne('orders', ord);
 }
 
 // 一次性迁移守卫：把旧标量字段构造成 comments 数组

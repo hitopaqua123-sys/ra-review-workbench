@@ -1,6 +1,6 @@
 // Service Worker — app shell offline cache for PWA
 // offline-first: navigation -> cached app shell; static assets -> cache-first (stale-while-revalidate)
-const CACHE = 'review-admin-v24';
+const CACHE = 'review-admin-v25';
 const SHELL = [
   './',
   'index.html',
