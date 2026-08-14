@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814d';
+const APP_VERSION = '20260814e';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -560,6 +560,7 @@ const TABLE_SCHEMAS = {
     { key: 'source', label: '来源', sortable: true, filterable: true },
     { key: 'followers', label: '粉丝数', sortable: true, filterable: false },
     { key: 'cooperationCount', label: '合作次数', sortable: true, filterable: false },
+    { key: 'coopAttr', label: '合作属性', sortable: true, filterable: true },
     { key: 'product', label: '产品', sortable: true, filterable: true },
     { key: 'refundMethod', label: '返款方式', sortable: true, filterable: true },
     { key: 'ppAccount', label: 'PayPal', sortable: true, filterable: true },
@@ -601,7 +602,7 @@ const TABLE_SCHEMAS = {
     { key: 'images', label: '截图', sortable: false, filterable: false },
     { key: 'sourceTag', label: '来源', sortable: true, filterable: true },
     { key: 'reviewStatus', label: '状态', sortable: true, filterable: true },
-    { key: 'reviewSubmitDate', label: '提交时间', sortable: true, filterable: false },
+    { key: 'reviewSubmitDate', label: '提交时间', sortable: true, filterable: true },
   ],
 };
 function getTableState(key) {
@@ -1418,6 +1419,12 @@ async function renderCustomers(c, keepScroll = false) {
           if (_dd) { v = _dd; }
           else if (c.key === 'name') v = `<td><span class="customer-name-link" data-cid="${x.id}">${esc(x.name)}</span></td>`;
           else if (c.key === 'followers' || c.key === 'cooperationCount') v = `<td class="num">${fmtInt(x[c.key])}</td>`;
+          else if (c.key === 'coopAttr') {
+            const cnt = Number(x.cooperationCount || x.cooperationIndex || 0);
+            const attr = cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作');
+            const cls = cnt <= 0 ? 'neutral' : (cnt === 1 ? 'success' : 'warning');
+            v = `<td><span class="badge badge-${cls}">${attr}</span></td>`;
+          }
           else if (c.key === 'startDate') v = `<td>${fmtDate(x.startDate)}</td>`;
           else if (c.key === '__formula__') v = `<td class="num">${esc(applyFormula(c.formulaExpr, x))}</td>`;
           else v = `<td ${c.key === 'product' || c.key === 'ppAccount' ? 'class="cell-ellipsis"' : ''}>${esc(x[c.key])}</td>`;
@@ -2323,19 +2330,39 @@ async function deleteOrder(id) {
   const allComments = await getAll('comments');
   const linkedComments = allComments.filter((c) => c.orderId === id || (c.orderNumber && o && c.orderNumber === o.orderNumber));
   let msg = '确定删除该订单？此操作不可撤销。';
-  if (linkedComments.length > 0) msg += `\n\n⚠️ 该订单关联 ${linkedComments.length} 条评论记录，删除后评论仍保留但失去订单关联。`;
+  if (linkedComments.length > 0) msg += `\n\n⚠️ 该订单关联 ${linkedComments.length} 条评论记录，将同步标记为「订单已删除」。`;
   if (!confirm(msg)) return;
+  // 同步更新关联评论：清除 orderId、标记来源为已删除订单
+  for (const c of linkedComments) {
+    c.orderId = null;
+    c._orderDeleted = true;
+    c._deletedOrderNumber = o ? o.orderNumber : '';
+    c.updatedAt = new Date().toISOString();
+    await putOne('comments', c);
+  }
   await delOne('orders', id);
   if (o) await recomputeCustomerStatsForOrder(o);
   renderCustomersIfVisible(true);
-  toast('已删除', 'success'); render();
+  toast(linkedComments.length ? `已删除订单，${linkedComments.length} 条评论已同步更新` : '已删除', 'success'); render();
 }
 async function batchDeleteOrders() {
   const ids = [...state.orders.sel];
   if (!ids.length) { toast('请先勾选要删除的订单', 'info'); return; }
-  if (!confirm(`确定删除选中的 ${ids.length} 个订单？此操作不可撤销。\n（批量删除不会自动删除相关客户的其它订单）`)) return;
   const orders = await getAll('orders');
   const toDelete = orders.filter((o) => ids.includes(o.id));
+  // 先同步更新关联评论
+  const allComments = await getAll('comments');
+  let syncedCount = 0;
+  for (const o of toDelete) {
+    const linked = allComments.filter((c) => c.orderId === o.id || (c.orderNumber && o.orderNumber && c.orderNumber === o.orderNumber));
+    for (const c of linked) {
+      c.orderId = null; c._orderDeleted = true; c._deletedOrderNumber = o.orderNumber || '';
+      c.updatedAt = new Date().toISOString();
+      await putOne('comments', c);
+      syncedCount++;
+    }
+  }
+  if (!confirm(`确定删除选中的 ${ids.length} 个订单？此操作不可撤销。\n${syncedCount > 0 ? `将同步标记 ${syncedCount} 条关联评论为「订单已删除」。\n` : ''}（批量删除不会自动删除相关客户的其它订单）`)) return;
   const affectedCustomerIds = new Set();
   for (const o of toDelete) {
     await delOne('orders', o.id);
@@ -2344,7 +2371,7 @@ async function batchDeleteOrders() {
   for (const cid of affectedCustomerIds) await recomputeCustomerStatsById(cid);
   renderCustomersIfVisible(true);
   state.orders.sel = [];
-  toast(`已删除 ${ids.length} 个订单`, 'success'); render();
+  toast(`已删除 ${ids.length} 个订单${syncedCount > 0 ? `，${syncedCount} 条评论已同步` : ''}`, 'success'); render();
 }
 
 /* ============================================================
@@ -2453,6 +2480,9 @@ async function fetchComments() {
   if (f.kw) list = list.filter((x) => matchKw(f.kw, [x.customerName, x.customerEmail, x.product, x.orderNumber]));
   if (f.status) list = list.filter((x) => x.reviewStatus === f.status);
   if (f.sourceTag) list = list.filter((x) => (x.sourceTag || '').toLowerCase().includes(f.sourceTag.toLowerCase()));
+  // 提交时间日期范围筛选
+  if (f.dateFrom) list = list.filter((x) => x.reviewSubmitDate && x.reviewSubmitDate >= f.dateFrom);
+  if (f.dateTo) list = list.filter((x) => x.reviewSubmitDate && x.reviewSubmitDate <= f.dateTo + 'T23:59:59');
   list = applyColFilter('comments', list);
   list = applyColSort('comments', list);
   return list;
@@ -2495,7 +2525,11 @@ async function renderComments(c, keepScroll = false) {
       <div class="toolbar">
         <input class="input" style="max-width:260px" id="cm-kw" placeholder="搜索客户、邮箱、产品、订单号…" value="${esc(state.comments.kw)}">
         ${comboFilterHtml({ id: 'cm-status', allLabel: '全部状态', value: state.comments.status, options: Object.keys(REVIEW_STATUS), displayMap: Object.fromEntries(Object.entries(REVIEW_STATUS).map(([k,v])=>[k,v.label])) })}
-        ${comboFilterHtml({ id: 'cm-source', allLabel: '全部来源', value: state.comments.sourceTag, options: sourceTags })}
+        <label class="tiny muted" style="white-space:nowrap;align-self:center;margin-left:4px">提交时间</label>
+        <input class="input" style="max-width:130px" type="date" id="cm-date-from" value="${esc(state.comments.dateFrom || '')}" placeholder="起始日期">
+        <span class="tiny muted" style="align-self:center">~</span>
+        <input class="input" style="max-width:130px" type="date" id="cm-date-to" value="${esc(state.comments.dateTo || '')}" placeholder="截止日期">
+        ${comboFilterHtml({ id: 'cm-source', allLabel: '来源', value: state.comments.sourceTag, options: sourceTags })}
         <div class="grow"></div>
         <button class="btn btn-sm" id="cm-excel-out">⭳ 导出Excel</button>
         <button class="btn btn-sm" id="cm-excel-in">⭱ 导入Excel</button>
@@ -2556,6 +2590,8 @@ async function renderComments(c, keepScroll = false) {
   $('#cm-kw').addEventListener('input', (e) => { state.comments.kw = e.target.value; state.comments.displayCount = PAGE; renderComments(c, true); });
   initCombo(c, 'cm-status', { value: state.comments.status, allLabel: '全部状态', options: Object.keys(REVIEW_STATUS), baseOptions: Object.keys(REVIEW_STATUS), displayMap: Object.fromEntries(Object.entries(REVIEW_STATUS).map(([k,v])=>[k,v.label])), onSelect: (v) => { state.comments.status = v; state.comments.displayCount = PAGE; renderComments(c); } });
   initCombo(c, 'cm-source', { value: state.comments.sourceTag, allLabel: '全部来源', options: sourceTags, baseOptions: sourceTags, onSelect: (v) => { state.comments.sourceTag = v; state.comments.displayCount = PAGE; renderComments(c); } });
+  $('#cm-date-from').addEventListener('change', (e) => { state.comments.dateFrom = e.target.value; state.comments.displayCount = PAGE; renderComments(c, true); });
+  $('#cm-date-to').addEventListener('change', (e) => { state.comments.dateTo = e.target.value; state.comments.displayCount = PAGE; renderComments(c, true); });
 
   $('#cm-excel-out').addEventListener('click', () => exportCommentsExcel());
   $('#cm-excel-in').addEventListener('click', () => importCommentsExcel());
@@ -3176,7 +3212,8 @@ async function exportCustomersExcel() {
     { key: 'name', label: '姓名', wch: 18 }, { key: 'email', label: '邮箱', wch: 24 },
     { key: 'country', label: '国家', wch: 8 }, { key: 'source', label: '来源', wch: 12 },
     { key: 'followers', label: '粉丝数', wch: 10 }, { key: 'product', label: '测评产品', wch: 20 },
-    { key: 'cooperationCount', label: '合作次数', wch: 10 }, { key: 'refundMethod', label: '返款方式', wch: 14 },
+    { key: 'cooperationCount', label: '合作次数', wch: 10 }, { key: 'coopAttr', label: '合作属性', wch: 12 },
+    { key: 'refundMethod', label: '返款方式', wch: 14 },
     { key: 'needShippingAdvance', label: '垫付运费', wch: 10 }, { key: 'ppAccount', label: 'PayPal账号', wch: 22 },
     { key: 'latestFollowUp', label: '最新跟进', wch: 28 }, { key: 'startDate', label: '开始日期', wch: 12 },
     { key: 'lastOrderDate', label: '最新合作日期', wch: 12 }, { key: 'socialMediaUrl', label: '社媒链接', wch: 30 },
@@ -3192,9 +3229,11 @@ async function exportCustomersExcel() {
     for (const c of comments) { if (c.submitDate) { submitDate = c.submitDate; break; } }
     if (!submitDate && comments.length) submitDate = comments[0].submitDate || null;
     if (!submitDate) submitDate = x.reviewSubmitDate || null;
+    const cnt = Number(x.cooperationCount || x.cooperationIndex || 0);
     return {
       ...x,
       needShippingAdvance: x.needShippingAdvance ? '是' : '否',
+      coopAttr: cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作'),
       reviewImages: images.join('\n'),
       reviewContent: content,
       reviewSubmitDate: submitDate,
@@ -3263,38 +3302,43 @@ function syncCommentMirrors(rec, store) {
 
 /* ---------- 跨模块双向联动：订单 <-> 客户评论管理 (v20260814c) ---------- */
 
-// 方向1：订单保存后，把订单的评论字段同步到 comments store（按订单号匹配）
+// 方向1：订单保存/修改/删除后，把订单字段同步到 comments store（按订单号匹配）
 // 存在对应评论则更新（仅更新最近一条，避免误改多条手动评论）；不存在且订单含评论数据则自动新建
 async function syncOrderReviewToComments(order) {
   if (!order) return;
   const onum = String(order.orderNumber || '').trim().toLowerCase();
   if (!onum) return;
-  const hasReviewData = Boolean(
-    (order.reviewContent && String(order.reviewContent).trim()) ||
-    (Array.isArray(order.reviewImages) && order.reviewImages.length) ||
-    order.reviewSubmitDate
-  );
   const allComments = await getAll('comments');
   const matched = allComments
     .filter((c) => c.orderNumber && String(c.orderNumber).trim().toLowerCase() === onum)
     .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
 
   if (matched.length) {
-    // 仅更新最近一条，保留其他（如手动多条）评论不被覆盖
+    // 更新最近一条关联评论：同步所有关键字段（不仅是评论字段）
     const target = matched[0];
     target.reviewContent = order.reviewContent || '';
     target.images = Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [];
     target.reviewSubmitDate = order.reviewSubmitDate || null;
-    if (order.customerName) target.customerName = order.customerName;
-    if (order.customerEmail) target.customerEmail = order.customerEmail;
-    if (order.product) target.product = order.product;
-    if (order.store) target.store = order.store;
+    // 同步客户/产品/店铺/状态等全部可变字段
+    if (order.customerName != null) target.customerName = order.customerName;
+    if (order.customerEmail != null) target.customerEmail = order.customerEmail;
+    if (order.product != null) target.product = order.product;
+    if (order.store != null) target.store = order.store;
+    if (order.status != null) {
+      // 订单状态映射到评论状态
+      const statusMap = { pending_refund: 'pending_invite', refunded: 'reviewed', completed: 'reviewed', cancelled: 'cancelled' };
+      target.reviewStatus = statusMap[order.status] || target.reviewStatus || 'pending_invite';
+    }
+    if (order.amount != null) target._orderAmount = order.amount;
+    if (order.country != null) target._orderCountry = order.country;
     target.orderId = order.id;
+    target._orderDeleted = false;
+    target._deletedOrderNumber = '';
     target.updatedAt = new Date().toISOString();
     await putOne('comments', target);
     console.log('[双向联动] 订单→评论：已更新评论(订单号 ' + order.orderNumber + ')');
     toast('已同步更新评论到「客户评论管理」', 'success');
-    // 同步更新订单内嵌 comments[] 镜像，保持详情页"评论管理"标签一致
+    // 同步更新订单内嵌 comments[] 镜像
     if (!Array.isArray(order.comments)) order.comments = [];
     const mi = order.comments.findIndex((c) => c.id === target.id);
     const mirror = { id: target.id, content: target.reviewContent, images: target.images, submitDate: target.reviewSubmitDate, source: 'order_sync' };
@@ -3303,7 +3347,13 @@ async function syncOrderReviewToComments(order) {
     return;
   }
 
-  if (!hasReviewData) return; // 订单无评论数据则不新建空评论
+  // 不存在对应评论 -> 仅当有评论数据时才新建
+  const hasReviewData = Boolean(
+    (order.reviewContent && String(order.reviewContent).trim()) ||
+    (Array.isArray(order.reviewImages) && order.reviewImages.length) ||
+    order.reviewSubmitDate
+  );
+  if (!hasReviewData) return;
 
   // 不存在对应评论 -> 自动新建一条评论记录
   const now = new Date().toISOString();
