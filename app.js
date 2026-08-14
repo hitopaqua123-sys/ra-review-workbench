@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814c';
+const APP_VERSION = '20260814d';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -2682,8 +2682,8 @@ async function openCommentForm(id) {
   });
 
   // preview & remove existing images
-  $$('.cf-preview-img', m).forEach((img) => img.addEventListener('click', (e) => { if (e.target === img) openImagePreview(img.src); }));
-  $$('.cf-rm-img', m).forEach((btn) => btn.addEventListener('click', (e) => { e.stopPropagation(); btn.parentElement.remove(); }));
+  $$('.cf-preview-img', m.root).forEach((img) => img.addEventListener('click', (e) => { if (e.target === img) openImagePreview(img.src); }));
+  $$('.cf-rm-img', m.root).forEach((btn) => btn.addEventListener('click', (e) => { e.stopPropagation(); btn.parentElement.remove(); }));
 
   // save
   $('#cf-save').addEventListener('click', async () => {
@@ -2728,7 +2728,7 @@ async function openCommentForm(id) {
       else matchedOrder.comments.push({ id: recData.id, content: recData.reviewContent, images: recData.images, submitDate: recData.reviewSubmitDate, source: 'comments_page' });
       await syncCommentMirrors(matchedOrder, 'orders');
     }
-    closeAndReopen();
+    m.close();
     toast(isEdit ? '评论已更新' : '评论已创建', 'success');
     render();
   });
