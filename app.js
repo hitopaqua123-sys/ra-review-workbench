@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814e';
+const APP_VERSION = '20260814f';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -595,6 +595,7 @@ const TABLE_SCHEMAS = {
   ],
   comments: [
     { key: 'customerName', label: '客户', sortable: true, filterable: true },
+    { key: 'coopAttr', label: '合作属性', sortable: true, filterable: true },
     { key: 'productStore', label: '产品 / 店铺', sortable: true, filterable: false },
     { key: 'orderNumber', label: '订单号', sortable: true, filterable: true },
     { key: 'reviewContent', label: '评论内容', sortable: false, filterable: false },
@@ -2493,6 +2494,19 @@ async function renderComments(c, keepScroll = false) {
   const allCustomers = await getAll('customers');
   const allOrders = await getAll('orders');
 
+  // 建立客户快速索引（按名称/邮箱，忽略大小写与空格），用于按「客户管理合作次数」反查合作属性
+  const custByName = {}; const custByEmail = {};
+  allCustomers.forEach((cc) => {
+    if (cc.name) custByName[String(cc.name).trim().toLowerCase()] = cc;
+    if (cc.email) custByEmail[String(cc.email).trim().toLowerCase()] = cc;
+  });
+  function findCustForComment(x) {
+    const byName = custByName[String(x.customerName || '').trim().toLowerCase()];
+    if (byName) return byName;
+    if (x.customerEmail) { const byMail = custByEmail[String(x.customerEmail || '').trim().toLowerCase()]; if (byMail) return byMail; }
+    return {};
+  }
+
   // 如果 comments store 为空但有订单评论数据，做一次迁移
   if (!allComments.length) {
     const migrated = await migrateOrderCommentsToDedicatedStore();
@@ -2544,10 +2558,16 @@ async function renderComments(c, keepScroll = false) {
         <th class="col-actions-th"></th>
       </tr></thead><tbody>
         ${pageRows.length ? buildTbody('comments', pageRows, (x) => {
-          const cust = allCustomers.find((cc) => cc.name === x.customerName) || {};
+          const cust = findCustForComment(x);
           const tds = getTableState('comments').filter((col) => !col.hidden).map((col) => {
             let v = '';
             if (col.key === 'customerName') v = `<td><span class="customer-name-link" data-cid="${cust.id || ''}" title="跳转客户详情">${esc(x.customerName)}</span>${x.customerEmail ? `<br><span class="tiny muted">${esc(x.customerEmail)}</span>` : ''}</td>`;
+            else if (col.key === 'coopAttr') {
+              const cnt = Number(cust.cooperationCount || cust.cooperationIndex || 0);
+              const attr = cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作');
+              const cls = cnt <= 0 ? 'neutral' : (cnt === 1 ? 'success' : 'warning');
+              v = `<td><span class="badge badge-${cls}">${attr}</span></td>`;
+            }
             else if (col.key === 'productStore') {
               const parts = [];
               if (x.product) parts.push(esc(x.product));
@@ -2869,22 +2889,34 @@ async function importCommentsExcel() {
 async function exportCommentsExcel() {
   const all = await fetchComments();
   if (!all.length) return toast('没有评论数据可导出', 'warning');
-  const rows = all.map((x) => ({
-    '订单号': x.orderNumber || '',
-    '客户': x.customerName || '',
-    '邮箱': x.customerEmail || '',
-    '产品': x.product || '',
-    '店铺': x.store || '',
-    '评论内容': x.reviewContent || '',
-    '测评内容/反馈': x.feedback || '',
-    '星级': x.rating || '',
-    '状态': (REVIEW_STATUS[x.reviewStatus] || {}).label || '',
-    '提交时间': x.reviewSubmitDate || '',
-    '来源标签': x.sourceTag || '',
-    '截图': (x.images || []).join('; '),
-  }));
+  const allCustomers = await getAll('customers');
+  const custByName = {}; const custByEmail = {};
+  allCustomers.forEach((cc) => {
+    if (cc.name) custByName[String(cc.name).trim().toLowerCase()] = cc;
+    if (cc.email) custByEmail[String(cc.email).trim().toLowerCase()] = cc;
+  });
+  const rows = all.map((x) => {
+    const cust = custByName[String(x.customerName || '').trim().toLowerCase()] || (x.customerEmail ? custByEmail[String(x.customerEmail || '').trim().toLowerCase()] : null) || {};
+    const cnt = Number(cust.cooperationCount || cust.cooperationIndex || 0);
+    const coopAttr = cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作');
+    return {
+      '订单号': x.orderNumber || '',
+      '客户': x.customerName || '',
+      '合作属性': coopAttr,
+      '邮箱': x.customerEmail || '',
+      '产品': x.product || '',
+      '店铺': x.store || '',
+      '评论内容': x.reviewContent || '',
+      '测评内容/反馈': x.feedback || '',
+      '星级': x.rating || '',
+      '状态': (REVIEW_STATUS[x.reviewStatus] || {}).label || '',
+      '提交时间': x.reviewSubmitDate || '',
+      '来源标签': x.sourceTag || '',
+      '截图': (x.images || []).join('; '),
+    };
+  });
   const ws = XLSX.utils.json_to_sheet(rows);
-  XLSX.utils.sheet_add_aoa(ws, [['订单号','客户','邮箱','产品','店铺','评论内容','测评内容/反馈','星级','状态','提交时间','来源标签','截图']], { origin: 'A1' });
+  XLSX.utils.sheet_add_aoa(ws, [['订单号','客户','合作属性','邮箱','产品','店铺','评论内容','测评内容/反馈','星级','状态','提交时间','来源标签','截图']], { origin: 'A1' });
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '评论列表');
   XLSX.writeFile(wb, `评论导出_${todayISO()}.xlsx`);
   toast(`已导出 ${all.length} 条评论`, 'success');
