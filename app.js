@@ -14,6 +14,9 @@ const fmtMoney = (n) => Number(n || 0).toLocaleString('en-US', { minimumFraction
 const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
+/* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
+const APP_VERSION = '20260814c';
+
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
   const content = $('#content');
@@ -3289,6 +3292,8 @@ async function syncOrderReviewToComments(order) {
     target.orderId = order.id;
     target.updatedAt = new Date().toISOString();
     await putOne('comments', target);
+    console.log('[双向联动] 订单→评论：已更新评论(订单号 ' + order.orderNumber + ')');
+    toast('已同步更新评论到「客户评论管理」', 'success');
     // 同步更新订单内嵌 comments[] 镜像，保持详情页"评论管理"标签一致
     if (!Array.isArray(order.comments)) order.comments = [];
     const mi = order.comments.findIndex((c) => c.id === target.id);
@@ -3321,6 +3326,8 @@ async function syncOrderReviewToComments(order) {
     updatedAt: now,
   };
   await putOne('comments', recData);
+  console.log('[双向联动] 订单→评论：已新建评论(订单号 ' + order.orderNumber + ')');
+  toast('已新建 1 条评论到「客户评论管理」', 'success');
   if (!Array.isArray(order.comments)) order.comments = [];
   order.comments.push({ id: recData.id, content: recData.reviewContent, images: recData.images, submitDate: recData.reviewSubmitDate, source: 'order_sync' });
   await putOne('orders', order);
@@ -3343,6 +3350,8 @@ async function syncCommentReviewToOrder(comment) {
   const mirror = { id: comment.id, content: comment.reviewContent, images: comment.images, submitDate: comment.reviewSubmitDate, source: 'comments_page' };
   if (mi >= 0) ord.comments[mi] = mirror; else ord.comments.push(mirror);
   await putOne('orders', ord);
+  console.log('[双向联动] 评论→订单：已回写订单(订单号 ' + ord.orderNumber + ')');
+  toast('已同步回写评论到「订单管理」', 'success');
 }
 
 // 一次性迁移守卫：把旧标量字段构造成 comments 数组
@@ -3830,6 +3839,10 @@ async function loadSeedData() {
    INIT
    ============================================================ */
 async function init() {
+  // 动态显示真实运行版本（破解“写死徽标”造成的缓存误判）
+  const badge = $('#app-version-badge');
+  if (badge) badge.textContent = APP_VERSION;
+  console.log('[工作台] 当前运行 app.js 版本：', APP_VERSION);
   $$('.nav-item').forEach((b) => b.addEventListener('click', () => navigate(b.dataset.view)));
   $('#btn-back').addEventListener('click', (e) => { e.stopPropagation(); closeTopFloat(); });
   $('#btn-close-all').addEventListener('click', (e) => { e.stopPropagation(); closeAllFloats(); });
