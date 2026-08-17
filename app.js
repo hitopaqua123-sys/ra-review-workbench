@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814h';
+const APP_VERSION = '20260814j';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -328,16 +328,241 @@ function getOne(store, id) {
   });
 }
 function putOne(store, item) {
-  return new Promise((res, rej) => {
+  if (item && typeof item === 'object' && !item.updatedAt) item.updatedAt = new Date().toISOString();
+  const local = new Promise((res, rej) => {
     tx(store, 'readwrite').then((os) => { const r = os.put(item); r.onsuccess = () => res(item); r.onerror = () => rej(r.error); }).catch(rej);
   });
+  local.then(() => {
+    if (isCloudActive() && !applyingRemote) cloudUpsert(store, item).catch((e) => console.warn('[cloud] upsert', e));
+  }).catch(() => {});
+  return local;
 }
 function delOne(store, id) {
-  return new Promise((res, rej) => {
+  const local = new Promise((res, rej) => {
     tx(store, 'readwrite').then((os) => { const r = os.delete(id); r.onsuccess = () => res(); r.onerror = () => rej(r.error); }).catch(rej);
   });
+  local.then(() => {
+    if (isCloudActive() && !applyingRemote) cloudDelete(store, String(id)).catch((e) => console.warn('[cloud] delete', e));
+  }).catch(() => {});
+  return local;
 }
 async function bulkPut(store, items) { for (const it of items) await putOne(store, it); }
+
+/* ============================================================
+   云端账号同步（Supabase）—— 包裹式，不影响现有本地逻辑
+   模式：local（仅本机） / cloud（账号云端同步，多设备实时）
+   ============================================================ */
+// ⚠️ 占位符：建好 Supabase 项目后，把下面两个值替换成真实值（由 Anna 提供）
+const SUPABASE_URL = 'https://cxlugyulwvtftkwkqafq.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_06BenVO6Yds551xL08m9Sg_fDH1I_4y';
+
+let _sbClient = null;
+function sbClient() {
+  if (_sbClient) return _sbClient;
+  if (typeof window.supabase === 'undefined' || !SUPABASE_URL.startsWith('http')) return null;
+  try { _sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY); }
+  catch (e) { console.warn('[cloud] Supabase 初始化失败', e); return null; }
+  return _sbClient;
+}
+function cloudConfigured() {
+  return SUPABASE_URL.startsWith('http') && SUPABASE_ANON_KEY.length > 20 && SUPABASE_ANON_KEY !== 'REPLACE_WITH_SUPABASE_ANON_KEY';
+}
+
+const SYNC_MODE_KEY = 'ra_sync_mode'; // 'local' | 'cloud'
+function getSyncMode() { return localStorage.getItem(SYNC_MODE_KEY) || 'local'; }
+function setSyncMode(m) { localStorage.setItem(SYNC_MODE_KEY, m); }
+
+let _sbUser = null;
+async function refreshSbUser() {
+  const s = sbClient();
+  if (!s) { _sbUser = null; return null; }
+  try { const { data } = await s.auth.getUser(); _sbUser = data && data.user ? data.user : null; }
+  catch (e) { _sbUser = null; }
+  return _sbUser;
+}
+function isCloudActive() {
+  return getSyncMode() === 'cloud' && cloudConfigured() && !!_sbUser;
+}
+
+// 防止实时回写造成云端环路
+let applyingRemote = false;
+function setApplyingRemote(v) { applyingRemote = v; }
+
+// 云端写入（upsert / delete）—— 云端表 records(user_id, store, rec_id, data, updated_at)
+async function cloudUpsert(store, item) {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  const rec = { user_id: _sbUser.id, store, rec_id: String(item.id), data: item, updated_at: new Date().toISOString() };
+  const { error } = await s.from('records').upsert(rec, { onConflict: 'user_id,store,rec_id' });
+  if (error) console.warn('[cloud] upsert 失败', store, item.id, error.message);
+}
+async function cloudDelete(store, id) {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  const { error } = await s.from('records').delete().eq('user_id', _sbUser.id).eq('store', store).eq('rec_id', String(id));
+  if (error) console.warn('[cloud] delete 失败', store, id, error.message);
+}
+
+// 登录 / 注册 / 登出
+async function cloudLogin(email, password) {
+  const s = sbClient(); if (!s) return { ok: false, msg: '云端未配置' };
+  const { data, error } = await s.auth.signInWithPassword({ email, password });
+  if (error) return { ok: false, msg: error.message };
+  _sbUser = data.user;
+  setSyncMode('cloud');
+  await cloudPullAll();
+  setupRealtime();
+  updateCloudUI();
+  return { ok: true };
+}
+async function cloudSignUp(email, password) {
+  const s = sbClient(); if (!s) return { ok: false, msg: '云端未配置' };
+  if (!password || password.length < 6) return { ok: false, msg: '密码至少 6 位' };
+  const { data, error } = await s.auth.signUp({ email, password });
+  if (error) return { ok: false, msg: error.message };
+  if (data.user && data.session) {
+    _sbUser = data.user;
+    setSyncMode('cloud');
+    await cloudPullAll();
+    setupRealtime();
+    updateCloudUI();
+    return { ok: true };
+  }
+  return { ok: false, msg: '注册成功，请查收邮箱完成验证后再登录' };
+}
+async function cloudLogout() {
+  const s = sbClient();
+  if (s) { try { await s.auth.signOut(); } catch (e) {} }
+  if (_sbChannel && s) { try { s.removeChannel(_sbChannel); } catch (e) {} _sbChannel = null; }
+  _sbUser = null;
+  setSyncMode('local');
+  updateCloudUI();
+}
+
+// 登录后把该账号全部云端记录拉到本地
+async function cloudPullAll() {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  const stores = ['customers', 'orders', 'comments', 'settlements'];
+  try {
+    setApplyingRemote(true);
+    for (const store of stores) {
+      const { data, error } = await s.from('records').select('data').eq('user_id', _sbUser.id).eq('store', store);
+      if (error) { console.warn('[cloud] 拉取失败', store, error.message); continue; }
+      const items = (data || []).map((r) => r.data).filter(Boolean);
+      for (const it of items) await putOne(store, it);
+    }
+  } finally {
+    setApplyingRemote(false);
+  }
+  console.log('[cloud] 已拉取全部云端记录');
+}
+
+// 实时订阅：其他设备改动自动同步到本机
+let _sbChannel = null;
+function setupRealtime() {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  if (_sbChannel) { try { s.removeChannel(_sbChannel); } catch (e) {} _sbChannel = null; }
+  _sbChannel = s.channel('ra-records-' + _sbUser.id)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'records', filter: 'user_id=eq.' + _sbUser.id }, (payload) => {
+      applyRemoteChange(payload);
+    })
+    .subscribe((status) => { console.log('[cloud] 实时订阅状态:', status); });
+}
+async function applyRemoteChange(payload) {
+  if (!isCloudActive()) return;
+  try {
+    setApplyingRemote(true);
+    if (payload.eventType === 'DELETE') {
+      const old = payload.old || {};
+      if (old.store && old.rec_id != null) await delOne(old.store, old.rec_id);
+    } else {
+      const neu = payload.new || {};
+      if (neu.store && neu.data) await putOne(neu.store, neu.data);
+    }
+  } finally {
+    setApplyingRemote(false);
+  }
+  if (typeof render === 'function') render();
+}
+
+// 顶栏 / 侧边栏云端状态
+function updateCloudUI() {
+  const btn = $('#btn-cloud');
+  const status = $('#cloud-status');
+  const env = $('.env-tag');
+  if (getSyncMode() === 'cloud' && _sbUser) {
+    if (btn) { btn.textContent = '☁️ 云端：' + (_sbUser.email || '已登录'); btn.classList.add('btn-primary'); }
+    if (status) status.textContent = '☁️ 云端已同步 · ' + (_sbUser.email || '');
+    if (env) env.textContent = '云端版 · 多设备实时同步';
+  } else if (getSyncMode() === 'cloud' && !_sbUser) {
+    if (btn) { btn.textContent = '☁️ 云端：点击登录'; btn.classList.remove('btn-primary'); }
+    if (status) status.textContent = '☁️ 云端：未登录';
+    if (env) env.textContent = '本地版 · 数据存于本机浏览器';
+  } else {
+    if (btn) { btn.textContent = '💾 本地模式'; btn.classList.remove('btn-primary'); }
+    if (status) status.textContent = '💾 本地模式（仅本机）';
+    if (env) env.textContent = '本地版 · 数据存于本机浏览器';
+  }
+}
+
+// 账号弹窗（登录 / 注册 / 登出）
+function openAuthModal() {
+  const m = openModal(`
+    <h3 style="margin:0 0 4px">☁️ 云端账号</h3>
+    <p class="tiny muted" style="margin:0 0 14px">登录后业务数据保存至云端，可在电脑/手机等多设备实时同步。</p>
+    <div class="field"><label>邮箱</label><input class="input" id="auth-email" type="email" placeholder="you@example.com" autocomplete="username"></div>
+    <div class="field"><label>密码</label><input class="input" id="auth-pwd" type="password" placeholder="至少 6 位" autocomplete="current-password"></div>
+    <div id="auth-err" style="color:#dc2626;font-size:13px;min-height:18px;margin:6px 0"></div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn btn-primary" id="auth-login" style="flex:1">登录</button>
+      <button class="btn" id="auth-signup" style="flex:1">注册</button>
+    </div>
+    ${_sbUser ? '<div style="margin-top:12px"><button class="btn btn-danger" id="auth-logout" style="width:100%">退出当前账号（切回本地模式）</button></div>' : ''}
+  `);
+  const email = m.root.querySelector('#auth-email');
+  const pwd = m.root.querySelector('#auth-pwd');
+  const err = m.root.querySelector('#auth-err');
+  const login = m.root.querySelector('#auth-login');
+  const signup = m.root.querySelector('#auth-signup');
+  const logout = m.root.querySelector('#auth-logout');
+  const doLogin = async () => {
+    err.textContent = '登录中…';
+    const r = await cloudLogin(email.value.trim(), pwd.value);
+    if (r.ok) { m.close(); toast('云端登录成功', 'success'); if (typeof render === 'function') render(); }
+    else err.textContent = r.msg;
+  };
+  const doSignup = async () => {
+    err.textContent = '注册中…';
+    const r = await cloudSignUp(email.value.trim(), pwd.value);
+    if (r.ok) { m.close(); toast('注册成功，已进入云端', 'success'); if (typeof render === 'function') render(); }
+    else err.textContent = r.msg;
+  };
+  if (login) login.addEventListener('click', doLogin);
+  if (signup) signup.addEventListener('click', doSignup);
+  if (logout) logout.addEventListener('click', async () => { await cloudLogout(); m.close(); if (typeof render === 'function') render(); });
+  if (pwd) pwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+  setTimeout(() => { if (email) email.focus(); }, 50);
+}
+
+// 启动云端（若先前处于云端模式且已登录，自动恢复会话）
+async function initCloudOnLoad() {
+  if (!cloudConfigured()) { updateCloudUI(); return; }
+  const s = sbClient(); if (!s) { updateCloudUI(); return; }
+  await refreshSbUser();
+  if (_sbUser && getSyncMode() === 'cloud') {
+    await cloudPullAll();
+    setupRealtime();
+  }
+  updateCloudUI();
+}
+
+// 顶栏按钮：本地↔云端切换 / 登录
+function bindCloudButton() {
+  const btn = $('#btn-cloud');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (!cloudConfigured()) { toast('尚未配置云端（缺少 Supabase 密钥）', 'warning'); return; }
+    openAuthModal();
+  });
+}
 /* ---------- modal / drawer ---------- */
 function openModal(html, { wide = false } = {}) {
   const root = $('#modal-root');
@@ -3928,6 +4153,7 @@ async function init() {
   $$('.nav-item').forEach((b) => b.addEventListener('click', () => navigate(b.dataset.view)));
   $('#btn-back').addEventListener('click', (e) => { e.stopPropagation(); closeTopFloat(); });
   $('#btn-close-all').addEventListener('click', (e) => { e.stopPropagation(); closeAllFloats(); });
+  bindCloudButton();
   bindInfiniteScroll();
   // 点击页面任意空白区域：关闭所有下拉/菜单/侧边浮窗
   document.addEventListener('click', (e) => {
@@ -3947,6 +4173,8 @@ async function init() {
   ensureDefaultDropdownCfg();
   migrateComments();
   navigate('dashboard');
+  // 云端模式：若之前已登录则自动恢复会话并拉取/订阅
+  initCloudOnLoad().then(() => { if (typeof render === 'function') render(); }).catch((e) => console.warn('[cloud] 初始化失败', e));
 }
 /* ============================================================
    访问口令门（仅指定的人能打开网站）
