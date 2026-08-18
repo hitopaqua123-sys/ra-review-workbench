@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814l';
+const APP_VERSION = '20260814m';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -3576,6 +3576,7 @@ async function syncOrderReviewToComments(order) {
     target.reviewContent = order.reviewContent || '';
     target.images = Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [];
     target.reviewSubmitDate = order.reviewSubmitDate || null;
+    target.feedback = order.feedback || '';
     // 同步客户/产品/店铺/状态等全部可变字段
     if (order.customerName != null) target.customerName = order.customerName;
     if (order.customerEmail != null) target.customerEmail = order.customerEmail;
@@ -3583,7 +3584,7 @@ async function syncOrderReviewToComments(order) {
     if (order.store != null) target.store = order.store;
     if (order.status != null) {
       // 订单状态映射到评论状态
-      const statusMap = { pending_refund: 'pending_invite', refunded: 'reviewed', completed: 'reviewed', cancelled: 'cancelled' };
+      const statusMap = { pending_refund: 'pending_invite', refunded: 'reviewed', reviewed: 'reviewed' };
       target.reviewStatus = statusMap[order.status] || target.reviewStatus || 'pending_invite';
     }
     if (order.amount != null) target._orderAmount = order.amount;
@@ -3627,7 +3628,7 @@ async function syncOrderReviewToComments(order) {
     rating: null,
     reviewSubmitDate: order.reviewSubmitDate || null,
     reviewContent: order.reviewContent || '',
-    feedback: '',
+    feedback: order.feedback || '',
     images: Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [],
     createdAt: now,
     updatedAt: now,
@@ -3640,7 +3641,7 @@ async function syncOrderReviewToComments(order) {
   await putOne('orders', order);
 }
 
-// 方向2：评论保存后，把评论信息回写到对应订单的顶层评论字段
+// 方向2：评论保存后，把评论信息回写到对应订单的顶层字段（双向同步）
 async function syncCommentReviewToOrder(comment) {
   if (!comment) return;
   const orders = await getAll('orders');
@@ -3648,9 +3649,21 @@ async function syncCommentReviewToOrder(comment) {
     ? orders.find((o) => o.id === comment.orderId)
     : orders.find((o) => o.orderNumber && String(o.orderNumber).trim().toLowerCase() === String(comment.orderNumber || '').trim().toLowerCase());
   if (!ord) return;
+  // 回写评论内容类字段
   ord.reviewContent = comment.reviewContent || '';
   ord.reviewImages = Array.isArray(comment.images) ? comment.images.slice() : [];
   ord.reviewSubmitDate = comment.reviewSubmitDate || null;
+  ord.feedback = comment.feedback || '';
+  // 回写状态：评论状态 → 订单状态（反向映射）
+  if (comment.reviewStatus) {
+    const revStatusMap = { pending_invite: 'pending_refund', published: 'reviewed', reviewed: 'reviewed', review_lost: 'pending_refund', declined: 'pending_refund' };
+    ord.status = revStatusMap[comment.reviewStatus] || ord.status;
+  }
+  // 回写客户/产品/店铺等可变信息（评论端修改了也要同步到订单）
+  if (comment.customerName != null) ord.customerName = comment.customerName;
+  if (comment.customerEmail != null) ord.customerEmail = comment.customerEmail;
+  if (comment.product != null) ord.product = comment.product;
+  if (comment.store != null) ord.store = comment.store;
   // 同步更新订单内嵌 comments[] 镜像
   if (!Array.isArray(ord.comments)) ord.comments = [];
   const mi = ord.comments.findIndex((c) => c.id === comment.id);
@@ -3658,7 +3671,7 @@ async function syncCommentReviewToOrder(comment) {
   if (mi >= 0) ord.comments[mi] = mirror; else ord.comments.push(mirror);
   await putOne('orders', ord);
   console.log('[双向联动] 评论→订单：已回写订单(订单号 ' + ord.orderNumber + ')');
-  toast('已同步回写评论到「订单管理」', 'success');
+  toast('已同步回写到「订单管理」', 'success');
 }
 
 // 一次性迁移守卫：把旧标量字段构造成 comments 数组
