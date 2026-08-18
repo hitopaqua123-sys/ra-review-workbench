@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814k';
+const APP_VERSION = '20260814l';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -815,7 +815,7 @@ const TABLE_SCHEMAS = {
     { key: 'status', label: '状态', sortable: true, filterable: true },
     { key: 'reviewImages', label: '评论截图', sortable: false, filterable: false },
     { key: 'commentSummary', label: '评论内容', sortable: false, filterable: false },
-    { key: 'reviewSubmitDate', label: '评论提交时间', sortable: true, filterable: false },
+    { key: 'reviewSubmitDate', label: '沟通反馈', sortable: true, filterable: false, defaultHidden: true },
     { key: 'country', label: '国家', sortable: true, filterable: true },
   ],
   comments: [
@@ -834,7 +834,7 @@ const TABLE_SCHEMAS = {
 function getTableState(key) {
   if (!state[key].cols) {
     const schema = TABLE_SCHEMAS[key];
-    state[key].cols = schema.map((c) => ({ key: c.key, label: c.label, hidden: false, sort: null, filter: '' }));
+    state[key].cols = schema.map((c) => ({ key: c.key, label: c.label, hidden: !!c.defaultHidden, sort: null, filter: '' }));
   }
   return state[key].cols;
 }
@@ -2225,7 +2225,7 @@ async function renderOrders(c, keepScroll = false) {
           else if (c.key === 'orderNumber') v = `<td class="mono">${esc(x.orderNumber)}</td>`;
           else if (c.key === 'status') v = `<td>${statusBadge(x.status)}</td>`;
           else if (c.key === 'reviewImages') { const imgs = x.reviewImages || []; v = imgs.length ? `<td><div class="thumb-row">${imgs.slice(0, 3).map((u) => `<img class="cell-thumb" src="${esc(u)}" title="点击放大">`).join('')}${imgs.length > 3 ? ` <span class="tiny">+${imgs.length - 3}</span>` : ''}</div></td>` : `<td>—</td>`; }
-          else if (c.key === 'reviewSubmitDate') v = `<td>${x.reviewSubmitDate ? fmtDate(x.reviewSubmitDate) : '—'}</td>`;
+          else if (c.key === 'reviewSubmitDate') v = `<td class="cell-ellipsis">${esc(x.feedback || '—')}${x.reviewSubmitDate ? `<div class="tiny muted">${fmtDate(x.reviewSubmitDate)}</div>` : ''}</td>`;
           else if (c.key === 'commentSummary') {
             const cms = x.comments || [];
             if (!cms.length) v = `<td>—</td>`;
@@ -2815,7 +2815,7 @@ async function renderComments(c, keepScroll = false) {
               const st = REVIEW_STATUS[x.reviewStatus] || REVIEW_STATUS.pending_invite;
               v = `<td><span class="badge badge-${st.cls}">${st.label}</span></td>`;
             }
-            else if (col.key === 'reviewSubmitDate') v = `<td>${fmtDate(x.reviewSubmitDate)}</td>`;
+            else if (col.key === 'reviewSubmitDate') v = `<td class="cell-ellipsis">${x.reviewSubmitDate ? fmtDate(x.reviewSubmitDate) : '—'}</td>`;
             else if (col.key === 'orderNumber') v = `<td><span class="mono order-link" data-oid="${x.orderId || ''}" data-onum="${esc(x.orderNumber)}">${esc(x.orderNumber) || '—'}</span></td>`;
             else v = `<td>${esc(x[col.key])}</td>`;
             return v;
@@ -4030,7 +4030,10 @@ function openColumnSettings(key, onChange) {
         <button class="btn btn-sm col-dd" data-key="${c.key}">下拉配置</button>
       </div>`;
     }).join('')}</div>
-    <div class="row mt2" style="gap:10px;justify-content:flex-end"><button class="btn modal-close">关闭</button></div>
+    <div class="row mt2" style="gap:10px;justify-content:flex-end">
+      <button class="btn btn-sm btn-warning" id="col-reset-all">↩ 显示全部列</button>
+      <button class="btn modal-close">关闭</button>
+    </div>
   </div>`;
   const m = openModal(html);
   $$('.col-vis', m.root).forEach((cb) => cb.addEventListener('change', () => {
@@ -4041,6 +4044,13 @@ function openColumnSettings(key, onChange) {
     const col = cols.find((x) => x.key === b.dataset.key);
     if (col) openDropdownConfig(key, col, onChange);
   }));
+  const resetBtn = $('#col-reset-all', m.root);
+  if (resetBtn) resetBtn.addEventListener('click', () => {
+    cols.forEach((c) => { c.hidden = false; });
+    $$('.col-vis', m.root).forEach((cb) => { cb.checked = true; });
+    onChange();
+    toast('已显示全部列', 'success');
+  });
 }
 
 /* ---------- 月度有效评论统计（Chart.js） ---------- */
