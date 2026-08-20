@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260820q';
+const APP_VERSION = '20260820r';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -4461,6 +4461,25 @@ async function renderOutreach(c, keepScroll) {
     .o-act-btn.primary:hover { background:#333; }
     .o-act-btn.danger { color:#dc2626; border-color:#dc2626; }
     .o-act-btn.danger:hover { background:#fef2f2; }
+    /* status-colored action buttons */
+    .o-act-btn.st-pending { background:#6b7280; color:#fff; border-color:#6b7280; }
+    .o-act-btn.st-pending:hover { background:#4b5563; }
+    .o-act-btn.st-contacted { background:#2563eb; color:#fff; border-color:#2563eb; }
+    .o-act-btn.st-contacted:hover { background:#1d4ed8; }
+    .o-act-btn.st-confirmed { background:#4f46e5; color:#fff; border-color:#4f46e5; }
+    .o-act-btn.st-confirmed:hover { background:#4338ca; }
+    .o-act-btn.st-guiding { background:#ea580c; color:#fff; border-color:#ea580c; }
+    .o-act-btn.st-guiding:hover { background:#c2410c; }
+    .o-act-btn.st-paid { background:#16a34a; color:#fff; border-color:#16a34a; }
+    .o-act-btn.st-paid:hover { background:#15803d; }
+    .o-act-btn.st-review_requested { background:#db2777; color:#fff; border-color:#db2777; }
+    .o-act-btn.st-review_requested:hover { background:#be185d; }
+    .o-act-btn.st-review_retry { background:#dc2626; color:#fff; border-color:#dc2626; }
+    .o-act-btn.st-review_retry:hover { background:#b91c1c; }
+    .o-act-btn.st-reviewed { background:#059669; color:#fff; border-color:#059669; }
+    .o-act-btn.st-reviewed:hover { background:#047857; }
+    .o-act-btn.st-abandoned { background:#9ca3af; color:#fff; border-color:#9ca3af; }
+    .o-act-btn.st-abandoned:hover { background:#6b7280; }
     .o-empty { text-align:center; padding:40px; color:#999; font-size:14px; }
     .msg-card { border:1px solid #e5e5e5; border-radius:10px; padding:16px; margin-bottom:14px; }
     .msg-card h4 { font-size:14px; font-weight:700; margin-bottom:8px; }
@@ -4544,7 +4563,7 @@ async function renderOutreach(c, keepScroll) {
         <td>${outreachBadge(l.status)}</td>
         <td>${esc(fmtDate(l.lastActionDate || l.createdAt))}</td>
         <td><div class="o-act-btns" onclick="event.stopPropagation()">
-          ${transitions.map((t) => `<button class="o-act-btn primary" data-o-act="transition" data-id="${esc(l.id)}" data-to="${esc(t.to)}">${esc(t.label)}</button>`).join('')}
+          ${transitions.map((t) => `<button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${esc(t.to)}">${esc(t.label)}</button>`).join('')}
           <button class="o-act-btn" data-o-act="msg" data-id="${esc(l.id)}">消息</button>
           <button class="o-act-btn" data-o-act="edit" data-id="${esc(l.id)}">编辑</button>
           <button class="o-act-btn danger" data-o-act="delete" data-id="${esc(l.id)}">删除</button>
