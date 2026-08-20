@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260820p';
+const APP_VERSION = '20260820q';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -4534,7 +4534,7 @@ async function renderOutreach(c, keepScroll) {
       const url = l.profileUrl || '';
       const linkDisplay = url ? `<a class="o-link" href="${esc(url)}" target="_blank" rel="noopener">${esc(url.replace(/^https?:\/\//, '').slice(0, 30))}${url.length > 35 ? '…' : ''}</a>` : '—';
       const transitions = OUTREACH_TRANSITIONS[l.status] || [];
-      html += `<tr>
+      html += `<tr data-o-act="row" data-id="${esc(l.id)}" style="cursor:pointer">
         <td>${esc(platformIcon(l.platform))} ${esc(l.platform || '—')}</td>
         <td><strong>${esc(l.nickname || '—')}</strong></td>
         <td>${linkDisplay}</td>
@@ -4543,7 +4543,7 @@ async function renderOutreach(c, keepScroll) {
         <td>${l.email ? `<a class="o-link" href="mailto:${esc(l.email)}">${esc(l.email)}</a>` : '—'}</td>
         <td>${outreachBadge(l.status)}</td>
         <td>${esc(fmtDate(l.lastActionDate || l.createdAt))}</td>
-        <td><div class="o-act-btns">
+        <td><div class="o-act-btns" onclick="event.stopPropagation()">
           ${transitions.map((t) => `<button class="o-act-btn primary" data-o-act="transition" data-id="${esc(l.id)}" data-to="${esc(t.to)}">${esc(t.label)}</button>`).join('')}
           <button class="o-act-btn" data-o-act="msg" data-id="${esc(l.id)}">消息</button>
           <button class="o-act-btn" data-o-act="edit" data-id="${esc(l.id)}">编辑</button>
@@ -4582,7 +4582,7 @@ async function renderOutreach(c, keepScroll) {
       const id = btn.dataset.id;
       if (act === 'new') openLeadForm(null);
       else if (act === 'settings') openFollowSettings();
-      else if (act === 'edit') { const lead = allLeads.find((x) => x.id === id); if (lead) openLeadForm(lead); }
+      else if (act === 'edit' || act === 'row') { const lead = allLeads.find((x) => x.id === id); if (lead) openLeadForm(lead); }
       else if (act === 'delete') deleteLead(id);
       else if (act === 'transition') transitionLead(id, btn.dataset.to);
       else if (act === 'msg') { const lead = allLeads.find((x) => x.id === id); if (lead) openMessageGen(lead); }
@@ -4608,8 +4608,9 @@ function platformIcon(platform) {
 /* ---------- new / edit form ---------- */
 function openLeadForm(lead) {
   const isEdit = !!lead;
-  const l = lead || { platform: '', nickname: '', profileUrl: '', country: '', product: '', email: '', notes: '', reminderDays: '' };
-  const platforms = ['Instagram', 'TikTok', 'YouTube', 'Facebook', 'Twitter/X', 'Pinterest', 'Reddit', 'Blog', 'Other'];
+  const l = lead || { platform: 'TikTok', nickname: '', profileUrl: '', country: '', product: '', email: '', notes: '', reminderDays: '' };
+  const platforms = ['TikTok', 'Instagram', 'YouTube', 'Facebook', 'Twitter/X', 'Pinterest', 'Reddit', 'Blog', 'Other'];
+  const statusKeys = Object.keys(OUTREACH_STATUS);
   const html = `
     <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">${isEdit ? '编辑红人' : '+ 新发现红人'}</h3>
     <div class="o-form-row">
@@ -4638,7 +4639,14 @@ function openLeadForm(lead) {
       <label>邮箱</label>
       <input type="email" id="lf-email" value="${esc(l.email || '')}" placeholder="email@example.com">
     </div>
-    ${isEdit ? `<div class="o-form-row">
+    ${isEdit ? `
+    <div class="o-form-row">
+      <label>状态</label>
+      <select id="lf-status">
+        ${statusKeys.map((k) => `<option value="${k}" ${l.status === k ? 'selected' : ''}>${esc(OUTREACH_STATUS[k].label)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="o-form-row">
       <label>提醒天数</label>
       <input type="number" id="lf-days" value="${l.reminderDays != null ? l.reminderDays : ''}" placeholder="留空=用全局默认" min="0" max="365">
       <span style="font-size:12px;color:#999">覆盖全局设置（留空=默认）</span>
@@ -4649,10 +4657,11 @@ function openLeadForm(lead) {
     </div>
     <div style="display:flex;gap:10px;margin-top:16px">
       <button class="o-act-btn primary" style="flex:1;padding:10px" id="lf-save">${isEdit ? '保存' : '创建'}</button>
-      <button class="o-act-btn" style="flex:1;padding:10px" class="x-btn">取消</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" id="lf-cancel">取消</button>
     </div>
   `;
   const { close } = openModal(html);
+  $('#lf-cancel').addEventListener('click', close);
   $('#lf-save').addEventListener('click', async () => {
     const data = {
       platform: $('#lf-platform').value,
@@ -4666,7 +4675,7 @@ function openLeadForm(lead) {
     if (!data.nickname) { toast('请填写昵称', 'error'); return; }
     if (isEdit) {
       data.id = lead.id;
-      data.status = lead.status;
+      data.status = $('#lf-status') ? $('#lf-status').value : lead.status;
       data.lastActionDate = lead.lastActionDate || lead.createdAt;
       data.createdAt = lead.createdAt;
       data.updatedAt = new Date().toISOString();
@@ -4710,12 +4719,13 @@ function openFollowSettings() {
       <input type="password" id="fs-aikey" value="${esc(settings._aiKey || '')}" placeholder="留空=关闭 AI 重写" style="width:280px;text-align:left">
       <span class="hint">可选（OpenAI/兼容 API Key）</span>
     </div>
-    <div style="display:flex;gap:10px;margin-top:16px">
+    <div style="display:flex;gap:10px;margin-top:20px">
       <button class="o-act-btn primary" style="flex:1;padding:10px" id="fs-save">保存设置</button>
-      <button class="o-act-btn" style="flex:1;padding:10px" class="x-btn">关闭</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" id="fs-close">关闭</button>
     </div>
   `;
   const { close } = openModal(html);
+  $('#fs-close').addEventListener('click', close);
   $('#fs-save').addEventListener('click', () => {
     const newSettings = {};
     editable.forEach(([key]) => {
@@ -4733,6 +4743,8 @@ function openFollowSettings() {
 /* ---------- message generation ---------- */
 function openMessageGen(lead) {
   const msg = outreachMsg(lead);
+  const origEn = msg.en;
+  const origZh = msg.zh;
   const showZh = true; // Anna's preference: always show Chinese reference
   let currentLang = 'en';
   const html = `
@@ -4743,22 +4755,29 @@ function openMessageGen(lead) {
       <div class="msg-tab" data-lang="zh" ${!showZh ? 'style="display:none"' : ''}>中文参考</div>
     </div>
     <div class="msg-card" id="msg-en">
-      <h4>📋 English Message</h4>
-      <textarea id="mt-en" readonly>${esc(msg.en)}</textarea>
-      <button class="msg-copy-btn" data-copy="en">📋 复制英文</button>
+      <h4>📋 English Message <small style="font-weight:400;color:#888;font-size:12px">——可直接编辑</small></h4>
+      <textarea id="mt-en">${esc(msg.en)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="msg-copy-btn" data-copy="en">📋 复制英文</button>
+        <button class="o-act-btn" id="msg-reset-en" style="padding:8px 14px;font-size:13px">🔄 重置为模板</button>
+      </div>
     </div>
     <div class="msg-card" id="msg-zh" style="display:none">
-      <h4>📋 中文参考</h4>
-      <textarea id="mt-zh" readonly>${esc(msg.zh)}</textarea>
-      <button class="msg-copy-btn" data-copy="zh">📋 复制中文</button>
+      <h4>📋 中文参考 <small style="font-weight:400;color:#888;font-size:12px">——可直接编辑</small></h4>
+      <textarea id="mt-zh">${esc(msg.zh)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="msg-copy-btn" data-copy="zh">📋 复制中文</button>
+        <button class="o-act-btn" id="msg-reset-zh" style="padding:8px 14px;font-size:13px">🔄 重置为模板</button>
+      </div>
     </div>
     ${lead.email ? `<p style="font-size:13px;color:#666">📧 发送到: <a href="mailto:${esc(lead.email)}" class="o-link">${esc(lead.email)}</a></p>` : ''}
     <div style="display:flex;gap:10px;margin-top:14px">
       <button class="o-act-btn primary" style="flex:1;padding:10px" id="msg-sent">✅ 已发送，状态流转</button>
-      <button class="o-act-btn" style="padding:10px" class="x-btn">关闭</button>
+      <button class="o-act-btn" style="padding:10px" id="msg-close">关闭</button>
     </div>
   `;
   const { close } = openModal(html, { wide: true });
+  $('#msg-close').addEventListener('click', close);
 
   // tab switching
   $$('.msg-tab').forEach((tab) => {
@@ -4790,6 +4809,10 @@ function openMessageGen(lead) {
       });
     });
   });
+
+  // reset buttons
+  $('#msg-reset-en').addEventListener('click', () => { $('#mt-en').value = origEn; toast('已重置英文模板', 'success'); });
+  $('#msg-reset-zh').addEventListener('click', () => { $('#mt-zh').value = origZh; toast('已重置中文模板', 'success'); });
 
   // mark sent → transition
   $('#msg-sent').addEventListener('click', async () => {
