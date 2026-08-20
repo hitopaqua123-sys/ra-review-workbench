@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260820o';
+const APP_VERSION = '20260820p';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -271,10 +271,10 @@ const DB_NAME = 'review_ops_workbench';
 let _db = null;
 function openDB() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open(DB_NAME, 3);
+    const r = indexedDB.open(DB_NAME, 4);
     r.onupgradeneeded = (e) => {
       const db = e.target.result;
-      ['customers', 'orders', 'settlements', 'comments', 'versions'].forEach((s) => {
+      ['customers', 'orders', 'settlements', 'comments', 'versions', 'leads'].forEach((s) => {
         if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
       });
     };
@@ -440,7 +440,7 @@ async function cloudLogout() {
 // 登录后把该账号全部云端记录拉到本地
 async function cloudPullAll() {
   const s = sbClient(); if (!s || !_sbUser) return;
-  const stores = ['customers', 'orders', 'comments', 'settlements'];
+  const stores = ['customers', 'orders', 'comments', 'settlements', 'leads'];
   try {
     setApplyingRemote(true);
     for (const store of stores) {
@@ -739,6 +739,7 @@ const state = {
   pendingOrders: {},
   settlements: {},
   comments: { page: 1, pageSize: 15, kw: '', status: '', sourceTag: '', sel: [], displayCount: PAGE },
+  outreach: { kw: '', status: '' },
   charts: {},
 };
 
@@ -748,7 +749,7 @@ const state = {
 function navigate(view) {
   state.view = view;
   $$('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
-  const titles = { dashboard: '数据仪表盘', customers: '客户管理', orders: '订单管理', settlements: '结算管理', comments: '客户评论管理' };
+  const titles = { dashboard: '数据仪表盘', customers: '客户管理', orders: '订单管理', outreach: '红人跟进', settlements: '结算管理', comments: '客户评论管理' };
   $('#view-title').textContent = titles[view] || view;
   render();
 }
@@ -760,6 +761,7 @@ function render(keepScroll = false) {
   else if (state.view === 'orders') renderOrders(c, keepScroll);
   else if (state.view === 'settlements') renderSettlements(c);
   else if (state.view === 'comments') renderComments(c, keepScroll);
+  else if (state.view === 'outreach') renderOutreach(c, keepScroll);
 }
 function bindInfiniteScroll() {
   const c = $('#content');
@@ -4276,6 +4278,577 @@ async function loadSeedData() {
   } catch (e) {
     console.log('seed load skipped', e);
   }
+}
+
+/* ============================================================
+   红人跟进 · Outreach Module (v20260820p)
+   状态机: 待开发→已联系→意向确认→指导下单&退款→已转账→索要好评→(失败)再次索要好评→(成功)已留评
+   意向确认与指导下单&退款均可→放弃；已留评/放弃为终止态
+   ============================================================ */
+
+const OUTREACH_STATUS = {
+  pending:          { label: '待开发',       cls: 'neutral', nextAction: '发破冰私信',   defaultDays: 0 },
+  contacted:        { label: '已联系',       cls: 'warning',  nextAction: '发追单提醒',   defaultDays: 3 },
+  confirmed:        { label: '意向确认',     cls: 'info',     nextAction: '指导下单',     defaultDays: 1 },
+  guiding:          { label: '指导下单&退款', cls: 'info',     nextAction: '跟进下单/退款', defaultDays: 2 },
+  paid:             { label: '已转账',       cls: 'primary',  nextAction: '跟进使用体验', defaultDays: 7 },
+  review_requested: { label: '索要好评',     cls: 'warning',  nextAction: '索评',         defaultDays: 10 },
+  review_retry:     { label: '再次索要好评', cls: 'warning',  nextAction: '二次索评',     defaultDays: 5 },
+  reviewed:         { label: '已留评',       cls: 'success',  nextAction: null,            defaultDays: null },
+  abandoned:        { label: '放弃',         cls: 'muted',    nextAction: null,            defaultDays: null },
+};
+
+const OUTREACH_TRANSITIONS = {
+  pending:          [{ to: 'contacted', label: '已发私信' }],
+  contacted:        [{ to: 'confirmed', label: '已回复-有意' }, { to: 'abandoned', label: '放弃' }],
+  confirmed:        [{ to: 'guiding', label: '指导下单' }, { to: 'abandoned', label: '放弃' }],
+  guiding:          [{ to: 'paid', label: '已转账' }, { to: 'abandoned', label: '放弃' }],
+  paid:             [{ to: 'review_requested', label: '索要好评' }],
+  review_requested: [{ to: 'reviewed', label: '好评成功' }, { to: 'review_retry', label: '索评失败' }],
+  review_retry:     [{ to: 'reviewed', label: '好评成功' }, { to: 'abandoned', label: '放弃' }],
+  reviewed:         [],
+  abandoned:        [],
+};
+
+/* ---------- settings (localStorage-backed, per device) ---------- */
+const OUTREACH_SETTINGS_KEY = 'outreach_settings_v1';
+function getOutreachSettings() {
+  try {
+    const raw = localStorage.getItem(OUTREACH_SETTINGS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  // defaults
+  const defaults = {};
+  Object.entries(OUTREACH_STATUS).forEach(([k, v]) => {
+    defaults[k] = v.defaultDays;
+  });
+  defaults._aiKey = '';
+  return defaults;
+}
+function saveOutreachSettings(s) {
+  try { localStorage.setItem(OUTREACH_SETTINGS_KEY, JSON.stringify(s)); } catch (e) {}
+}
+function getOutreachInterval(lead) {
+  const settings = getOutreachSettings();
+  const cfg = OUTREACH_STATUS[lead.status];
+  if (!cfg || cfg.defaultDays == null) return null;
+  // per-lead override > global default
+  if (lead.reminderDays != null && lead.reminderDays !== '') return Number(lead.reminderDays);
+  return settings[lead.status] != null ? settings[lead.status] : cfg.defaultDays;
+}
+
+/* ---------- today's next actions ---------- */
+function computeOutreachActions(leads) {
+  const today = new Date();
+  const todayStr = todayISO();
+  const groups = { A: [], B: [], C: [] };
+  leads.forEach((l) => {
+    if (l.status === 'reviewed' || l.status === 'abandoned') return;
+    const cfg = OUTREACH_STATUS[l.status];
+    if (!cfg || !cfg.nextAction) return;
+    const interval = getOutreachInterval(l);
+    if (interval == null || interval <= 0) {
+      // immediate action (e.g. pending = 待开发)
+      if (l.status === 'pending') groups.A.push(l);
+      return;
+    }
+    const last = l.lastActionDate ? new Date(l.lastActionDate) : new Date(l.createdAt || todayStr);
+    const diffDays = Math.floor((today - last) / 86400000);
+    if (diffDays >= interval) {
+      if (l.status === 'contacted') groups.B.push({ ...l, overdue: diffDays });
+      else if (['paid', 'review_requested', 'review_retry'].includes(l.status)) groups.C.push({ ...l, overdue: diffDays });
+      else groups.A.push({ ...l, overdue: diffDays });
+    }
+  });
+  return groups;
+}
+
+/* ---------- status badge ---------- */
+function outreachBadge(s) {
+  const m = OUTREACH_STATUS[s] || { label: s || '—', cls: 'neutral' };
+  return `<span class="badge ${m.cls}">${esc(m.label)}</span>`;
+}
+
+/* ---------- message templates ---------- */
+function outreachMsg(lead, type) {
+  const nick = lead.nickname || 'there';
+  const product = lead.product || 'our aquarium product';
+  const platform = lead.platform || 'social media';
+  const email = lead.email || '';
+  const EN = {
+    icebreaker: `Hi ${nick}! 👋\n\nWe love your content on ${platform}! We're IBAY Aqua, an aquarium brand on Amazon. We'd love to send you a free ${product} in exchange for an honest review.\n\nWould you be interested? Let us know! 🐟`,
+    reminder: `Hi ${nick}! 👋\n\nJust following up on our previous message — we'd love to collaborate with you on a ${product} review. No pressure at all, but if you're interested, just reply and we'll get it shipped out! 🐠`,
+    guide: `Hi ${nick}! 👋\n\nGreat to hear you're interested! Here's how to order:\n\n1. Search for "${product}" on Amazon\n2. Add to cart and checkout normally\n3. Send us the order number and we'll refund you via PayPal after delivery\n\nAny questions? Just ask! 😊`,
+    review_request: `Hi ${nick}! 😊\n\nHope you're enjoying the ${product}! If you've had a chance to try it out, we'd really appreciate it if you could leave a quick review on Amazon. It helps us a lot and means the world to small brands like ours! ⭐\n\nHere's the link: (insert Amazon product link)\n\nThank you so much! 🐟`,
+    review_retry: `Hi ${nick}! 👋\n\nJust a gentle reminder — if you've had a chance to try the ${product}, a quick Amazon review would be incredibly helpful for us. It only takes a minute and really makes a difference for small brands! ⭐\n\nLink: (insert Amazon product link)\n\nThank you! 🐠`,
+    new_product: `Hi ${nick}! 👋\n\nWe just launched a new aquarium product and thought of you right away! Would you like to try it for another review collaboration? Let us know! 🐟`,
+  };
+  const ZH = {
+    icebreaker: `你好 ${nick}！👋\n\n我们在 ${platform} 上看到你的内容，非常喜欢！我们是 IBAY Aqua，亚马逊上的水族品牌。我们想免费寄送一份 ${product} 给你体验，作为交换希望你能留一条真实的评价。\n\n你有兴趣吗？告诉我们！🐟`,
+    reminder: `你好 ${nick}！👋\n\n跟进一下之前的信息——我们很想和你合作 ${product} 的评价。完全没压力，如果你有兴趣，回复我们就可以安排发货！🐠`,
+    guide: `你好 ${nick}！👋\n\n很高兴你有兴趣！下单方式如下：\n\n1. 在亚马逊搜索 "${product}"\n2. 加入购物车并正常下单结账\n3. 把订单号发给我们，收到货后通过 PayPal 退款给你\n\n有问题随时问！😊`,
+    review_request: `你好 ${nick}！😊\n\n希望你喜欢 ${product}！如果已经用上了，我们非常希望你能帮我们在亚马逊留一条简短评价。这对我们帮助很大，对小型品牌意义重大！⭐\n\n链接：（填入亚马逊产品链接）\n\n非常感谢！🐟`,
+    review_retry: `你好 ${nick}！👋\n\n温馨提醒一下——如果你已经体验了 ${product}，一条亚马逊评价对我们来说非常有帮助。只需要一分钟，对小品牌真的意义重大！⭐\n\n链接：（填入亚马逊产品链接）\n\n谢谢！🐠`,
+    new_product: `你好 ${nick}！👋\n\n我们刚推出一款新品水族产品，第一个想到你！你想再合作一次评价吗？告诉我们！🐟`,
+  };
+  const msgType = type || (lead.status === 'pending' ? 'icebreaker'
+    : lead.status === 'contacted' ? 'reminder'
+    : lead.status === 'confirmed' || lead.status === 'guiding' ? 'guide'
+    : lead.status === 'review_requested' ? 'review_request'
+    : lead.status === 'review_retry' ? 'review_retry'
+    : 'icebreaker');
+  return { en: EN[msgType] || EN.icebreaker, zh: ZH[msgType] || ZH.icebreaker, type: msgType, email };
+}
+
+/* ---------- main render ---------- */
+async function renderOutreach(c, keepScroll) {
+  const allLeads = await getAll('leads');
+  // sort: pending first, then by lastActionDate desc
+  allLeads.sort((a, b) => {
+    const order = { pending: 0, contacted: 1, confirmed: 2, guiding: 3, paid: 4, review_requested: 5, review_retry: 6, reviewed: 7, abandoned: 8 };
+    const oa = order[a.status] ?? 9;
+    const ob = order[b.status] ?? 9;
+    if (oa !== ob) return oa - ob;
+    return (b.lastActionDate || '').localeCompare(a.lastActionDate || '');
+  });
+
+  // filter
+  const kw = (state.outreach.kw || '').toLowerCase();
+  const statusFilter = state.outreach.status || '';
+  let leads = allLeads;
+  if (kw) {
+    leads = leads.filter((l) =>
+      [l.nickname, l.platform, l.country, l.product, l.email, l.notes].some((v) =>
+        String(v || '').toLowerCase().includes(kw)
+      )
+    );
+  }
+  if (statusFilter) leads = leads.filter((l) => l.status === statusFilter);
+
+  // today's next actions
+  const actions = computeOutreachActions(allLeads);
+  const totalActions = actions.A.length + actions.B.length + actions.C.length;
+
+  let html = `
+  <style>
+    .o-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+    .o-toolbar .o-search { flex:1; min-width:180px; padding:8px 12px; border:1px solid #ddd; border-radius:8px; font-size:14px; }
+    .o-toolbar select { padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-size:14px; }
+    .o-actions { margin-bottom:16px; }
+    .o-actions-head { font-size:15px; font-weight:700; margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .o-actions-head .count { background:#dc2626; color:#fff; border-radius:50%; min-width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; }
+    .o-actions-head .count.zero { background:#999; }
+    .o-action-group { margin-bottom:12px; }
+    .o-action-group-title { font-size:13px; font-weight:600; color:#666; margin-bottom:6px; }
+    .o-action-items { display:flex; flex-direction:column; gap:6px; }
+    .o-action-item { display:flex; align-items:center; gap:8px; padding:8px 12px; background:#f9f9f9; border-radius:8px; border:1px solid #eee; }
+    .o-action-item .o-nick { font-weight:600; font-size:13px; }
+    .o-action-item .o-meta { font-size:12px; color:#888; }
+    .o-action-item .o-act { margin-left:auto; font-size:12px; color:#0066cc; cursor:pointer; white-space:nowrap; }
+    .o-action-item .o-act:hover { text-decoration:underline; }
+    .o-action-empty { font-size:13px; color:#999; padding:4px 0; }
+    .o-table { width:100%; border-collapse:collapse; }
+    .o-table th, .o-table td { padding:8px 10px; text-align:left; border-bottom:1px solid #eee; font-size:13px; white-space:nowrap; }
+    .o-table th { background:#f5f5f5; font-weight:600; color:#555; }
+    .o-table tr:hover { background:#fafafa; }
+    .o-platform-ico { font-size:15px; }
+    .o-link { color:#0066cc; text-decoration:none; }
+    .o-link:hover { text-decoration:underline; }
+    .o-act-btns { display:flex; gap:4px; }
+    .o-act-btn { padding:4px 8px; border-radius:6px; font-size:12px; cursor:pointer; border:1px solid #ddd; background:#fff; white-space:nowrap; }
+    .o-act-btn:hover { background:#f0f0f0; }
+    .o-act-btn.primary { background:#111; color:#fff; border-color:#111; }
+    .o-act-btn.primary:hover { background:#333; }
+    .o-act-btn.danger { color:#dc2626; border-color:#dc2626; }
+    .o-act-btn.danger:hover { background:#fef2f2; }
+    .o-empty { text-align:center; padding:40px; color:#999; font-size:14px; }
+    .msg-card { border:1px solid #e5e5e5; border-radius:10px; padding:16px; margin-bottom:14px; }
+    .msg-card h4 { font-size:14px; font-weight:700; margin-bottom:8px; }
+    .msg-card textarea { width:100%; min-height:120px; border:1px solid #ddd; border-radius:8px; padding:10px; font-size:13px; line-height:1.6; resize:vertical; }
+    .msg-card .msg-copy-btn { margin-top:8px; padding:8px 18px; background:#111; color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600; }
+    .msg-card .msg-copy-btn:hover { background:#333; }
+    .msg-card .msg-copy-btn.copied { background:#16a34a; }
+    .msg-tabs { display:flex; gap:4px; margin-bottom:10px; }
+    .msg-tab { padding:6px 14px; border-radius:6px; cursor:pointer; font-size:13px; border:1px solid #ddd; background:#fff; }
+    .msg-tab.active { background:#111; color:#fff; border-color:#111; }
+    .o-form-row { display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
+    .o-form-row label { font-size:13px; font-weight:600; min-width:70px; }
+    .o-form-row input, .o-form-row select, .o-form-row textarea { flex:1; min-width:120px; padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-size:14px; }
+    .o-form-row textarea { min-height:60px; }
+    .o-form-full { width:100%; }
+    .o-settings-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+    .o-settings-row label { width:130px; font-size:13px; font-weight:600; }
+    .o-settings-row input { width:60px; padding:6px 8px; border:1px solid #ddd; border-radius:6px; text-align:center; }
+    .o-settings-row .hint { font-size:12px; color:#999; }
+  </style>
+  <div class="o-toolbar">
+    <button class="o-act-btn primary" data-o-act="new">+ 新发现</button>
+    <button class="o-act-btn" data-o-act="settings">⚙ 跟进设置</button>
+    <input class="o-search" type="text" placeholder="搜索昵称/平台/国家/产品/邮箱/备注…" value="${esc(state.outreach.kw || '')}" data-o-input="search">
+    <select data-o-input="status">
+      <option value="">全部状态</option>
+      ${Object.entries(OUTREACH_STATUS).map(([k, v]) => `<option value="${k}" ${statusFilter === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}
+    </select>
+    <span style="font-size:12px;color:#888">共 ${leads.length} 条</span>
+  </div>
+  `;
+
+  // today's next actions panel
+  html += `<div class="o-actions">`;
+  html += `<div class="o-actions-head">今日下一步 ${totalActions > 0 ? `<span class="count">${totalActions}</span>` : '<span class="count zero">0</span>'}</div>`;
+  if (totalActions === 0) {
+    html += `<div class="o-action-empty">🎉 暂无待办，所有红人都在跟进中</div>`;
+  } else {
+    if (actions.A.length) {
+      html += `<div class="o-action-group"><div class="o-action-group-title">A · 发私信 / 指导下单 (${actions.A.length})</div><div class="o-action-items">`;
+      actions.A.forEach((l) => {
+        html += `<div class="o-action-item"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><span class="o-act" data-o-act="go-msg" data-id="${esc(l.id)}">${esc(OUTREACH_STATUS[l.status]?.nextAction || '处理')} →</span></div>`;
+      });
+      html += `</div></div>`;
+    }
+    if (actions.B.length) {
+      html += `<div class="o-action-group"><div class="o-action-group-title">B · 未回复追单 (${actions.B.length})</div><div class="o-action-items">`;
+      actions.B.forEach((l) => {
+        html += `<div class="o-action-item"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">超 ${l.overdue || 0} 天</span><span class="o-act" data-o-act="go-msg" data-id="${esc(l.id)}">发提醒 →</span></div>`;
+      });
+      html += `</div></div>`;
+    }
+    if (actions.C.length) {
+      html += `<div class="o-action-group"><div class="o-action-group-title">C · 索评跟进 (${actions.C.length})</div><div class="o-action-items">`;
+      actions.C.forEach((l) => {
+        html += `<div class="o-action-item"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">超 ${l.overdue || 0} 天</span><span class="o-act" data-o-act="go-msg" data-id="${esc(l.id)}">${esc(OUTREACH_STATUS[l.status]?.nextAction || '索评')} →</span></div>`;
+      });
+      html += `</div></div>`;
+    }
+  }
+  html += `</div>`;
+
+  // leads table
+  if (leads.length === 0) {
+    html += `<div class="o-empty">还没有红人记录，点「+ 新发现」开始</div>`;
+  } else {
+    html += `<div class="table-wrap"><table class="data o-table"><thead><tr>
+      <th>平台</th><th>昵称</th><th>链接</th><th>国家</th><th>产品</th><th>邮箱</th><th>状态</th><th>最后操作</th><th>操作</th>
+    </tr></thead><tbody>`;
+    leads.forEach((l) => {
+      const url = l.profileUrl || '';
+      const linkDisplay = url ? `<a class="o-link" href="${esc(url)}" target="_blank" rel="noopener">${esc(url.replace(/^https?:\/\//, '').slice(0, 30))}${url.length > 35 ? '…' : ''}</a>` : '—';
+      const transitions = OUTREACH_TRANSITIONS[l.status] || [];
+      html += `<tr>
+        <td>${esc(platformIcon(l.platform))} ${esc(l.platform || '—')}</td>
+        <td><strong>${esc(l.nickname || '—')}</strong></td>
+        <td>${linkDisplay}</td>
+        <td>${esc(l.country || '—')}</td>
+        <td>${esc(l.product || '—')}</td>
+        <td>${l.email ? `<a class="o-link" href="mailto:${esc(l.email)}">${esc(l.email)}</a>` : '—'}</td>
+        <td>${outreachBadge(l.status)}</td>
+        <td>${esc(fmtDate(l.lastActionDate || l.createdAt))}</td>
+        <td><div class="o-act-btns">
+          ${transitions.map((t) => `<button class="o-act-btn primary" data-o-act="transition" data-id="${esc(l.id)}" data-to="${esc(t.to)}">${esc(t.label)}</button>`).join('')}
+          <button class="o-act-btn" data-o-act="msg" data-id="${esc(l.id)}">消息</button>
+          <button class="o-act-btn" data-o-act="edit" data-id="${esc(l.id)}">编辑</button>
+          <button class="o-act-btn danger" data-o-act="delete" data-id="${esc(l.id)}">删除</button>
+        </div></td>
+      </tr>`;
+    });
+    html += `</tbody></table></div>`;
+  }
+
+  c.innerHTML = html;
+
+  // bind events
+  const searchInput = $('[data-o-input="search"]', c);
+  if (searchInput) {
+    let searchTimer;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        state.outreach.kw = searchInput.value;
+        renderOutreach(c, true);
+      }, 250);
+    });
+  }
+  const statusSel = $('[data-o-input="status"]', c);
+  if (statusSel) {
+    statusSel.addEventListener('change', () => {
+      state.outreach.status = statusSel.value;
+      renderOutreach(c, true);
+    });
+  }
+  // button delegations
+  $$('[data-o-act]', c).forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const act = btn.dataset.oAct;
+      const id = btn.dataset.id;
+      if (act === 'new') openLeadForm(null);
+      else if (act === 'settings') openFollowSettings();
+      else if (act === 'edit') { const lead = allLeads.find((x) => x.id === id); if (lead) openLeadForm(lead); }
+      else if (act === 'delete') deleteLead(id);
+      else if (act === 'transition') transitionLead(id, btn.dataset.to);
+      else if (act === 'msg') { const lead = allLeads.find((x) => x.id === id); if (lead) openMessageGen(lead); }
+      else if (act === 'go-msg') { const lead = allLeads.find((x) => x.id === id); if (lead) openMessageGen(lead); }
+    });
+  });
+}
+
+/* ---------- platform icon ---------- */
+function platformIcon(platform) {
+  const p = String(platform || '').toLowerCase();
+  if (p.includes('instagram')) return '📷';
+  if (p.includes('tiktok')) return '🎵';
+  if (p.includes('youtube') || p.includes('yt')) return '▶️';
+  if (p.includes('facebook') || p.includes('fb')) return '👥';
+  if (p.includes('twitter') || p.includes('x.com')) return '🐦';
+  if (p.includes('pinterest')) return '📌';
+  if (p.includes('reddit')) return '🤖';
+  if (p.includes('blog') || p.includes('web')) return '🌐';
+  return '👤';
+}
+
+/* ---------- new / edit form ---------- */
+function openLeadForm(lead) {
+  const isEdit = !!lead;
+  const l = lead || { platform: '', nickname: '', profileUrl: '', country: '', product: '', email: '', notes: '', reminderDays: '' };
+  const platforms = ['Instagram', 'TikTok', 'YouTube', 'Facebook', 'Twitter/X', 'Pinterest', 'Reddit', 'Blog', 'Other'];
+  const html = `
+    <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">${isEdit ? '编辑红人' : '+ 新发现红人'}</h3>
+    <div class="o-form-row">
+      <label>平台</label>
+      <select id="lf-platform">
+        ${platforms.map((p) => `<option value="${p}" ${l.platform === p ? 'selected' : ''}>${p}</option>`).join('')}
+      </select>
+    </div>
+    <div class="o-form-row">
+      <label>昵称</label>
+      <input type="text" id="lf-nick" value="${esc(l.nickname || '')}" placeholder="红人昵称">
+    </div>
+    <div class="o-form-row">
+      <label>主页链接</label>
+      <input type="url" id="lf-url" value="${esc(l.profileUrl || '')}" placeholder="https://...">
+    </div>
+    <div class="o-form-row">
+      <label>国家</label>
+      <input type="text" id="lf-country" value="${esc(l.country || '')}" placeholder="US / DE / UK ...">
+    </div>
+    <div class="o-form-row">
+      <label>产品</label>
+      <input type="text" id="lf-product" value="${esc(l.product || '')}" placeholder="关联产品名称">
+    </div>
+    <div class="o-form-row">
+      <label>邮箱</label>
+      <input type="email" id="lf-email" value="${esc(l.email || '')}" placeholder="email@example.com">
+    </div>
+    ${isEdit ? `<div class="o-form-row">
+      <label>提醒天数</label>
+      <input type="number" id="lf-days" value="${l.reminderDays != null ? l.reminderDays : ''}" placeholder="留空=用全局默认" min="0" max="365">
+      <span style="font-size:12px;color:#999">覆盖全局设置（留空=默认）</span>
+    </div>` : ''}
+    <div class="o-form-row">
+      <label>备注</label>
+      <textarea id="lf-notes" placeholder="备注信息…">${esc(l.notes || '')}</textarea>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="o-act-btn primary" style="flex:1;padding:10px" id="lf-save">${isEdit ? '保存' : '创建'}</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" class="x-btn">取消</button>
+    </div>
+  `;
+  const { close } = openModal(html);
+  $('#lf-save').addEventListener('click', async () => {
+    const data = {
+      platform: $('#lf-platform').value,
+      nickname: $('#lf-nick').value.trim(),
+      profileUrl: $('#lf-url').value.trim(),
+      country: $('#lf-country').value.trim(),
+      product: $('#lf-product').value.trim(),
+      email: $('#lf-email').value.trim(),
+      notes: $('#lf-notes').value.trim(),
+    };
+    if (!data.nickname) { toast('请填写昵称', 'error'); return; }
+    if (isEdit) {
+      data.id = lead.id;
+      data.status = lead.status;
+      data.lastActionDate = lead.lastActionDate || lead.createdAt;
+      data.createdAt = lead.createdAt;
+      data.updatedAt = new Date().toISOString();
+      data.reminderDays = $('#lf-days') ? $('#lf-days').value : lead.reminderDays;
+      data.commLog = lead.commLog || [];
+      await putOne('leads', data);
+      toast('已保存', 'success');
+    } else {
+      data.id = uid();
+      data.status = 'pending';
+      const now = new Date().toISOString();
+      data.lastActionDate = now;
+      data.createdAt = now;
+      data.updatedAt = now;
+      data.commLog = [{ date: now.slice(0, 10), action: '创建', detail: '新发现红人' }];
+      await putOne('leads', data);
+      toast('已创建，状态：待开发', 'success');
+    }
+    close();
+    render();
+  });
+}
+
+/* ---------- ⚙ follow settings ---------- */
+function openFollowSettings() {
+  const settings = getOutreachSettings();
+  const editable = Object.entries(OUTREACH_STATUS).filter(([, v]) => v.defaultDays != null);
+  let html = `
+    <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">⚙ 跟进设置</h3>
+    <p style="font-size:13px;color:#888;margin-bottom:16px">设置每个状态的默认提醒天数。到天数未操作的红人会出现在「今日下一步」面板。</p>
+    ${editable.map(([key, cfg]) => `
+      <div class="o-settings-row">
+        <label>${esc(cfg.label)}</label>
+        <input type="number" min="0" max="365" id="fs-${key}" value="${settings[key] ?? cfg.defaultDays}">
+        <span class="hint">天 ${cfg.nextAction ? '（' + esc(cfg.nextAction) + '）' : ''}</span>
+      </div>
+    `).join('')}
+    <hr style="margin:16px 0;border:none;border-top:1px solid #eee">
+    <div class="o-settings-row">
+      <label>AI 重写密钥</label>
+      <input type="password" id="fs-aikey" value="${esc(settings._aiKey || '')}" placeholder="留空=关闭 AI 重写" style="width:280px;text-align:left">
+      <span class="hint">可选（OpenAI/兼容 API Key）</span>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="o-act-btn primary" style="flex:1;padding:10px" id="fs-save">保存设置</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" class="x-btn">关闭</button>
+    </div>
+  `;
+  const { close } = openModal(html);
+  $('#fs-save').addEventListener('click', () => {
+    const newSettings = {};
+    editable.forEach(([key]) => {
+      const val = Number($('#fs-' + key).value);
+      newSettings[key] = isNaN(val) ? OUTREACH_STATUS[key].defaultDays : val;
+    });
+    newSettings._aiKey = $('#fs-aikey').value.trim();
+    saveOutreachSettings(newSettings);
+    toast('设置已保存', 'success');
+    close();
+    render();
+  });
+}
+
+/* ---------- message generation ---------- */
+function openMessageGen(lead) {
+  const msg = outreachMsg(lead);
+  const showZh = true; // Anna's preference: always show Chinese reference
+  let currentLang = 'en';
+  const html = `
+    <h3 style="font-size:16px;font-weight:700;margin-bottom:4px">消息生成 · ${esc(lead.nickname || '—')}</h3>
+    <p style="font-size:12px;color:#888;margin-bottom:14px">${esc(OUTREACH_STATUS[lead.status]?.label || '')} → ${esc(OUTREACH_STATUS[lead.status]?.nextAction || '')}</p>
+    <div class="msg-tabs">
+      <div class="msg-tab active" data-lang="en">English (发给客户)</div>
+      <div class="msg-tab" data-lang="zh" ${!showZh ? 'style="display:none"' : ''}>中文参考</div>
+    </div>
+    <div class="msg-card" id="msg-en">
+      <h4>📋 English Message</h4>
+      <textarea id="mt-en" readonly>${esc(msg.en)}</textarea>
+      <button class="msg-copy-btn" data-copy="en">📋 复制英文</button>
+    </div>
+    <div class="msg-card" id="msg-zh" style="display:none">
+      <h4>📋 中文参考</h4>
+      <textarea id="mt-zh" readonly>${esc(msg.zh)}</textarea>
+      <button class="msg-copy-btn" data-copy="zh">📋 复制中文</button>
+    </div>
+    ${lead.email ? `<p style="font-size:13px;color:#666">📧 发送到: <a href="mailto:${esc(lead.email)}" class="o-link">${esc(lead.email)}</a></p>` : ''}
+    <div style="display:flex;gap:10px;margin-top:14px">
+      <button class="o-act-btn primary" style="flex:1;padding:10px" id="msg-sent">✅ 已发送，状态流转</button>
+      <button class="o-act-btn" style="padding:10px" class="x-btn">关闭</button>
+    </div>
+  `;
+  const { close } = openModal(html, { wide: true });
+
+  // tab switching
+  $$('.msg-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      $$('.msg-tab').forEach((t) => t.classList.remove('active'));
+      tab.classList.add('active');
+      currentLang = tab.dataset.lang;
+      $('#msg-en').style.display = currentLang === 'en' ? '' : 'none';
+      $('#msg-zh').style.display = currentLang === 'zh' ? '' : 'none';
+    });
+  });
+
+  // copy buttons
+  $$('.msg-copy-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const lang = btn.dataset.copy;
+      const text = $('#mt-' + lang).value;
+      navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.textContent;
+        btn.textContent = '✅ 已复制';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
+      }).catch(() => {
+        // fallback
+        const ta = $('#mt-' + lang);
+        ta.select();
+        document.execCommand('copy');
+        toast('已复制', 'success');
+      });
+    });
+  });
+
+  // mark sent → transition
+  $('#msg-sent').addEventListener('click', async () => {
+    close();
+    // auto-transition based on current status
+    const transitions = OUTREACH_TRANSITIONS[lead.status] || [];
+    if (transitions.length === 1) {
+      await transitionLead(lead.id, transitions[0].to);
+    } else if (transitions.length > 1) {
+      // multiple options — just close, user picks from table
+      toast('请从表格选择下一步状态', 'info');
+    } else {
+      toast('当前状态为终止态', 'info');
+    }
+  });
+}
+
+/* ---------- state transition + comm log ---------- */
+async function transitionLead(id, newStatus) {
+  const lead = await getOne('leads', id);
+  if (!lead) { toast('记录不存在', 'error'); return; }
+  const oldStatus = lead.status;
+  if (oldStatus === newStatus) return;
+  const cfg = OUTREACH_STATUS[newStatus];
+  if (!cfg) { toast('未知状态: ' + newStatus, 'error'); return; }
+  const now = new Date().toISOString();
+  lead.status = newStatus;
+  lead.lastActionDate = now;
+  lead.updatedAt = now;
+  if (!lead.commLog) lead.commLog = [];
+  lead.commLog.push({
+    date: now.slice(0, 10),
+    action: `状态: ${OUTREACH_STATUS[oldStatus]?.label || oldStatus} → ${cfg.label}`,
+    detail: cfg.nextAction ? `下一步: ${cfg.nextAction}` : '终止',
+  });
+  await putOne('leads', lead);
+  toast(`已流转至「${cfg.label}」${cfg.nextAction ? '，下一步: ' + cfg.nextAction : ''}`, 'success');
+  render();
+}
+
+/* ---------- delete ---------- */
+async function deleteLead(id) {
+  const lead = await getOne('leads', id);
+  if (!lead) return;
+  const html = `
+    <h3 style="font-size:16px;font-weight:700;margin-bottom:12px">确认删除</h3>
+    <p style="font-size:14px;color:#666;margin-bottom:16px">删除后无法恢复。确认删除红人 <strong>${esc(lead.nickname)}</strong> (${esc(OUTREACH_STATUS[lead.status]?.label || '')})？</p>
+    <div style="display:flex;gap:10px">
+      <button class="o-act-btn danger" style="flex:1;padding:10px" id="dl-confirm">删除</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" class="x-btn">取消</button>
+    </div>
+  `;
+  const { close } = openModal(html);
+  $('#dl-confirm').addEventListener('click', async () => {
+    await delOne('leads', id);
+    toast('已删除', 'success');
+    close();
+    render();
+  });
 }
 
 /* ============================================================
