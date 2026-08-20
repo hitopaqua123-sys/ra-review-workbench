@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814n';
+const APP_VERSION = '20260820o';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -1390,8 +1390,6 @@ async function renderDashboard(c) {
   const totalCustomers = customers.length;
   const totalOrders = orders.length;
   const monthlyNewCustomers = customers.filter((x) => ym(x.startDate) === thisMonth || ym(x.createdAt) === thisMonth).length;
-  const pendingCount = orders.filter((o) => o.status === 'pending_refund').length;
-  const settledAmount = orders.filter((o) => o.status !== 'pending_refund').reduce((s, o) => s + Number(o.amount || 0), 0);
 
   // country dist
   const cd = {};
@@ -1403,7 +1401,7 @@ async function renderDashboard(c) {
   orders.forEach((x) => { const k = x.store || '未知'; sd[k] = (sd[k] || 0) + 1; });
   const storeDist = Object.entries(sd).sort((a, b) => b[1] - a[1]);
 
-  // monthly trend (last 6 months)
+  // monthly trend (last 6 months) — 包含订单数、结算金额、新增客户数
   const months = [];
   for (let i = 5; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
@@ -1411,8 +1409,16 @@ async function renderDashboard(c) {
   }
   const trend = months.map((m) => {
     const os = orders.filter((o) => ym(o.orderDate) === m);
-    const settled = os.filter((o) => o.status !== 'pending_refund').reduce((s, o) => s + Number(o.amount || 0), 0);
-    return { month: m.slice(2), orderCount: os.length, settledAmount: settled };
+    const newCusts = customers.filter((x) => ym(x.startDate) === m || ym(x.createdAt) === m).length;
+    return { month: m.slice(2), orderCount: os.length, newCustomers: newCusts };
+  });
+
+  // 全部月份的新增客户+订单统计（用于明细表）
+  const allMonths = [...new Set([...customers.map((x) => ym(x.startDate) || ym(x.createdAt)), ...orders.map((o) => ym(o.orderDate))].filter(Boolean))].sort().reverse();
+  const monthlySummary = allMonths.slice(0, 12).map((m) => {
+    const oc = orders.filter((o) => ym(o.orderDate) === m);
+    const nc = customers.filter((x) => ym(x.startDate) === m || ym(x.createdAt) === m);
+    return { month: m, orderCount: oc.length, newCustomers: nc.length };
   });
 
   const recent = [...orders].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)).slice(0, 5);
@@ -1423,8 +1429,7 @@ async function renderDashboard(c) {
       <div class="stat" data-stat="customers" style="cursor:pointer" title="点击查看客户明细"><div class="stat-head"><span class="label">总客户数</span><span class="stat-ico">☺</span></div><div class="value">${fmtInt(totalCustomers)}</div><div class="sub">Customers</div></div>
       <div class="stat" data-stat="orders" style="cursor:pointer" title="点击查看订单明细"><div class="stat-head"><span class="label">总订单数</span><span class="stat-ico">▤</span></div><div class="value">${fmtInt(totalOrders)}</div><div class="sub">Review Orders</div></div>
       <div class="stat" data-stat="monthlyNew" style="cursor:pointer" title="点击查看本月新增客户"><div class="stat-head"><span class="label">本月新增客户</span><span class="stat-ico">✚</span></div><div class="value">${fmtInt(monthlyNewCustomers)}</div><div class="sub">This Month</div></div>
-      <div class="stat" data-stat="pending" style="cursor:pointer" title="点击查看待结算订单"><div class="stat-head"><span class="label">待结算订单</span><span class="stat-ico">⧗</span></div><div class="value">${fmtInt(pendingCount)}</div><div class="sub">Pending Refund</div></div>
-      <div class="stat" data-stat="settled" style="cursor:pointer" title="点击查看已结算明细"><div class="stat-head"><span class="label">已结算金额</span><span class="stat-ico">$</span></div><div class="value">${fmtAmount(settledAmount, 'USD')}</div><div class="sub">Settled Amount (USD 等值)</div></div>
+      <div class="stat" data-stat="monthlyTable" style="cursor:pointer" title="查看月度统计明细"><div class="stat-head"><span class="label">近12月新增客户</span><span class="stat-ico">📈</span></div><div class="value">${fmtInt(monthlySummary.reduce((s, m) => s + m.newCustomers, 0))}</div><div class="sub">累计 (人)</div></div>
     </div>
     <div class="chart-grid">
       <div class="chart-box">
@@ -1440,7 +1445,7 @@ async function renderDashboard(c) {
     </div>
     <div class="chart-grid" style="grid-template-columns:1fr">
       <div class="chart-box">
-        <h4>月度订单与结算趋势</h4>
+        <h4>月度订单与新增客户趋势</h4>
         <div class="chart-toolbar">
           <button class="btn btn-sm ${state.charts.trendRange === 1 ? 'active' : ''}" data-tr="1">近1个月</button>
           <button class="btn btn-sm ${state.charts.trendRange === 3 ? 'active' : ''}" data-tr="3">近3个月</button>
@@ -1451,6 +1456,11 @@ async function renderDashboard(c) {
         </div>
         <div class="chart-canvas-wrap"><canvas id="trendChart"></canvas></div>
       </div>
+    </div>
+    <div class="card mt"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">📊 月度统计明细（近12个月）</h4>
+      <div class="table-wrap"><table class="data"><thead><tr><th>月份</th><th class="num">新增客户</th><th class="num">订单数</th></tr></thead><tbody>
+        ${monthlySummary.map((m) => `<tr><td>${esc(m.month)}</td><td class="num">${fmtInt(m.newCustomers)}</td><td class="num">${fmtInt(m.orderCount)}</td></tr>`).join('')}
+      </tbody></table></div>
     </div>
     <div class="card mt"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">最近订单</h4>
       ${recent.length ? `<div class="table-wrap"><table class="data"><thead><tr><th>订单号</th><th>客户</th><th>店铺</th><th>产品</th><th class="num">金额</th><th>状态</th><th>日期</th></tr></thead><tbody>
@@ -1506,16 +1516,16 @@ async function openStatDetail(type) {
     title = `本月新增客户明细 (${list.length})`;
     headers = ['姓名', '国家', '来源', '开始日期'];
     rows = list.map((x) => [esc(x.name), esc(x.country), esc(x.source), fmtDate(x.startDate)]);
-  } else if (type === 'pending') {
-    const list = orders.filter((o) => o.status === 'pending_refund');
-    title = `待结算订单明细 (${list.length})`;
-    headers = ['订单号', '客户', '店铺', '金额', '日期'];
-    rows = list.map((o) => [esc(o.orderNumber), esc(o.customerName), esc(o.store), fmtAmount(o.amount, o.currency || o.country), fmtDate(o.orderDate)]);
-  } else if (type === 'settled') {
-    const list = orders.filter((o) => o.status !== 'pending_refund');
-    title = `已结算金额明细 (${list.length})`;
-    headers = ['订单号', '客户', '店铺', '金额', '状态'];
-    rows = list.map((o) => [esc(o.orderNumber), esc(o.customerName), esc(o.store), fmtAmount(o.amount, o.currency || o.country), statusBadge(o.status)]);
+  } else if (type === 'monthlyTable') {
+    const list = customers.slice();
+    title = `近12个月新增客户趋势`;
+    headers = ['月份', '新增客户', '订单数'];
+    const ms = {};
+    list.forEach((x) => { const k = ym(x.startDate) || ym(x.createdAt); if (k) ms[k] = (ms[k] || 0) + 1; });
+    const om = {};
+    orders.forEach((o) => { const k = ym(o.orderDate); if (k) om[k] = (om[k] || 0) + 1; });
+    const keys = Object.keys({ ...ms, ...om }).sort().reverse().slice(0, 12);
+    rows = keys.map((k) => [k, fmtInt(ms[k] || 0), fmtInt(om[k] || 0)]);
   }
   const html = `<div class="table-wrap"><table class="data"><thead><tr>${headers.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>
     ${rows.map((cells) => `<tr>${cells.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}
@@ -1532,14 +1542,14 @@ function drawTrend(id, trend) {
     type: 'bar',
     data: { labels: data.map((t) => t.month), datasets: [
       { type: 'bar', label: '订单数量', data: data.map((t) => t.orderCount), yAxisID: 'y', backgroundColor: '#FFD600', borderRadius: 6, barPercentage: 0.45, order: 2 },
-      { type: 'line', label: '结算金额($)', data: data.map((t) => t.settledAmount), yAxisID: 'y1', borderColor: '#111111', backgroundColor: '#111111', pointRadius: 5, pointBackgroundColor: '#FFD600', pointBorderColor: '#111111', pointBorderWidth: 2, tension: .35, borderWidth: 2.5, order: 1 },
+      { type: 'line', label: '新增客户', data: data.map((t) => t.newCustomers || 0), yAxisID: 'y1', borderColor: '#111111', backgroundColor: '#111111', pointRadius: 5, pointBackgroundColor: '#FFD600', pointBorderColor: '#111111', pointBorderWidth: 2, tension: .35, borderWidth: 2.5, order: 1 },
     ]},
     options: {
       responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
       plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } }, tooltip: { callbacks: { label: (c) => `${c.dataset.label}：${c.raw}` } } },
       scales: {
         y: { position: 'left', beginAtZero: true, title: { display: true, text: '订单数量', color: '#666', font: { weight: '700' } }, grid: { color: 'rgba(0,0,0,.05)' }, ticks: { color: '#666' } },
-        y1: { position: 'right', beginAtZero: true, title: { display: true, text: '结算金额($)', color: '#666', font: { weight: '700' } }, grid: { drawOnChartArea: false }, ticks: { color: '#666' } },
+        y1: { position: 'right', beginAtZero: true, title: { display: true, text: '新增客户', color: '#666', font: { weight: '700' } }, grid: { drawOnChartArea: false }, ticks: { color: '#666' } },
         x: { grid: { display: false }, ticks: { color: '#666', maxRotation: 30, minRotation: 0 } }
       }
     },
@@ -2700,8 +2710,8 @@ async function renderSettlements(c) {
 const REVIEW_STATUS = {
   pending_invite: { label: '待邀约', cls: 'warning' },
   published: { label: '已发布', cls: 'primary' },
-  review_lost: { label: '评价丢失', cls: 'danger' },
-  declined: { label: '拒绝评价', cls: 'muted' },
+  pending_supplement: { label: '待补差价', cls: 'warning' },
+  follow_up_review: { label: '追加评价', cls: 'info' },
   reviewed: { label: '已评价', cls: 'success' },
 };
 
@@ -3106,7 +3116,7 @@ async function importCommentsExcel() {
         feedback: String(rowObj.feedback || ''),
         images: shotImgs,
         sourceTag: String(rowObj.sourceTag || rowObj.source || ''),
-        reviewStatus: normStatus(String(rowObj.reviewStatus || rowObj.status || '')),
+        reviewStatus: normReviewStatus(String(rowObj.reviewStatus || rowObj.status || '')),
         rating: parseInt(rowObj.rating, 10) || null,
         reviewSubmitDate: excelDate(rowObj.reviewSubmitDate),
         createdAt: new Date().toISOString(),
@@ -3321,6 +3331,17 @@ function normStatus(v) {
   if (['refunded', '已返款', '已退款'].includes(s)) return 'refunded';
   if (['reviewed', '已评价', '已评'].includes(s)) return 'reviewed';
   return 'pending_refund';
+}
+function normReviewStatus(v) {
+  const s = String(v || '').trim().toLowerCase();
+  if (['pending_invite', '待邀约', '待邀请'].includes(s)) return 'pending_invite';
+  if (['published', '已发布', '发布'].includes(s)) return 'published';
+  if (['pending_supplement', '待补差价', '补差价'].includes(s)) return 'pending_supplement';
+  if (['follow_up_review', '追加评价', '追加'].includes(s)) return 'follow_up_review';
+  if (['reviewed', '已评价', '已评'].includes(s)) return 'reviewed';
+  if (['review_lost', '评价丢失', '丢失'].includes(s)) return 'reviewed'; // 兼容旧值
+  if (['declined', '拒绝评价', '拒绝'].includes(s)) return 'pending_invite'; // 兼容旧值
+  return 'pending_invite';
 }
 function pick(row, field) {
   // row keys already normalized to camelCase
@@ -3743,7 +3764,7 @@ async function syncCommentReviewToOrder(comment) {
   ord.feedback = comment.feedback || '';
   // 回写状态：评论状态 → 订单状态（反向映射）
   if (comment.reviewStatus) {
-    const revStatusMap = { pending_invite: 'pending_refund', published: 'reviewed', reviewed: 'reviewed', review_lost: 'pending_refund', declined: 'pending_refund' };
+    const revStatusMap = { pending_invite: 'pending_refund', published: 'reviewed', reviewed: 'reviewed', pending_supplement: 'pending_refund', follow_up_review: 'pending_refund' };
     ord.status = revStatusMap[comment.reviewStatus] || ord.status;
   }
   // 回写客户/产品/店铺等可变信息（评论端修改了也要同步到订单）
