@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260814m';
+const APP_VERSION = '20260814n';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -692,7 +692,13 @@ function imagesEditHtml(rec, field = 'reviewImages') {
 async function bindImagesEdit(root, rec, store, field = 'reviewImages', onChange) {
   const zone = $('.images-edit', root);
   if (!zone) return;
-  zone.addEventListener('click', (e) => { if (e.target.closest('.img-del')) return; zone.focus(); });
+  zone.addEventListener('click', (e) => {
+    // 点击缩略图（非删除按钮）放大预览
+    const thumbImg = e.target.closest('.img-thumb img');
+    if (thumbImg) { e.stopPropagation(); openImagePreview(thumbImg.src); return; }
+    if (e.target.closest('.img-del')) return;
+    zone.focus();
+  });
   zone.addEventListener('paste', async (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     const items = [...e.clipboardData.items].filter((it) => it.type.indexOf('image') !== -1);
@@ -2775,6 +2781,7 @@ async function renderComments(c, keepScroll = false) {
         <button class="btn btn-sm btn-danger" id="cm-batch">🗑 批量删除 (<span id="cm-batch-n">0</span>)</button>
         <button class="btn btn-sm" id="cm-cols" title="列设置">⚙ 列设置</button>
         <button class="btn btn-primary btn-sm" id="cm-add">+ 新增评论</button>
+        <button class="btn btn-sm" id="cm-repair" style="border:1px solid #f59e0b;color:#b45309;background:#fffbeb" title="扫描所有「已评价」订单：评论管理中无记录的自动补建、订单详情评论 tab 为空的自动补全">🔧 补建缺失评论</button>
       </div>
       ${filterTagsHtml('comments')}
       <div class="table-wrap"><table class="data sticky-first-col" data-table="comments"><thead><tr>
@@ -2842,6 +2849,10 @@ async function renderComments(c, keepScroll = false) {
   $('#cm-excel-in').addEventListener('click', () => importCommentsExcel());
   $('#cm-cols').addEventListener('click', () => openColumnSettings('comments', () => renderComments(c, true)));
   $('#cm-add').addEventListener('click', () => openCommentForm(null));
+  $('#cm-repair').addEventListener('click', async () => {
+    if (!confirm('将扫描所有「状态=已评价」的订单：\n• 评论管理中无对应记录的，自动补建到评论管理\n• 订单详情「评论管理」tab 为空的，自动补全\n\n是否继续？')) return;
+    await repairMissingComments();
+  });
 
   // batch delete
   const updateBatchUI = () => {
@@ -3641,6 +3652,82 @@ async function syncOrderReviewToComments(order) {
   await putOne('orders', order);
 }
 
+// 一键补建：扫描所有「状态=已评价」的订单，把缺失的评论记录补建到评论管理，
+// 并把订单详情「评论管理」tab 内嵌评论为空的补全（双向数据一致，修复历史断层）
+async function repairMissingComments() {
+  const orders = await getAll('orders');
+  const allComments = await getAll('comments');
+  const reviewed = orders.filter((o) => o.status === 'reviewed');
+  let createdStore = 0, updatedStore = 0, filledEmbedded = 0, skipped = 0;
+  for (const o of reviewed) {
+    const onum = String(o.orderNumber || '').trim().toLowerCase();
+    const hasReviewData = Boolean(
+      (o.reviewContent && String(o.reviewContent).trim()) ||
+      (Array.isArray(o.reviewImages) && o.reviewImages.length) ||
+      o.reviewSubmitDate ||
+      (o.feedback && String(o.feedback).trim())
+    );
+    if (!onum) { skipped++; continue; }
+
+    // 1) comments 表：无记录则补建，有记录则仅在空缺时补全（不覆盖手动录入）
+    const matched = allComments
+      .filter((c) => c.orderNumber && String(c.orderNumber).trim().toLowerCase() === onum)
+      .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+    if (matched.length) {
+      const target = matched[0];
+      target.reviewContent = target.reviewContent || o.reviewContent || '';
+      target.images = (Array.isArray(target.images) && target.images.length) ? target.images : (Array.isArray(o.reviewImages) ? o.reviewImages.slice() : []);
+      target.reviewSubmitDate = target.reviewSubmitDate || o.reviewSubmitDate || null;
+      target.feedback = target.feedback || o.feedback || '';
+      if (target.customerName == null) target.customerName = o.customerName || '';
+      if (target.customerEmail == null) target.customerEmail = o.customerEmail || '';
+      if (target.product == null) target.product = o.product || '';
+      if (target.store == null) target.store = o.store || '';
+      target.reviewStatus = target.reviewStatus || 'reviewed';
+      target.orderId = o.id; target._orderDeleted = false; target._deletedOrderNumber = '';
+      target.updatedAt = new Date().toISOString();
+      await putOne('comments', target);
+      allComments.push(target); // 防止同订单重复创建
+      updatedStore++;
+    } else {
+      if (!hasReviewData) { skipped++; continue; } // 无评价数据的不强行建空记录
+      const now = new Date().toISOString();
+      const rec = {
+        id: uid(), orderNumber: o.orderNumber, orderId: o.id,
+        customerName: o.customerName || '', customerEmail: o.customerEmail || '',
+        product: o.product || '', store: o.store || '', sourceTag: '',
+        reviewStatus: 'reviewed', rating: null,
+        reviewSubmitDate: o.reviewSubmitDate || null,
+        reviewContent: o.reviewContent || '', feedback: o.feedback || '',
+        images: Array.isArray(o.reviewImages) ? o.reviewImages.slice() : [],
+        createdAt: now, updatedAt: now,
+      };
+      await putOne('comments', rec);
+      allComments.push(rec);
+      createdStore++;
+    }
+
+    // 2) 订单内嵌 comments[]：为空且订单有评价数据则补全（让订单详情 tab 不再空白）
+    if (!Array.isArray(o.comments)) o.comments = [];
+    const embeddedHasReview = o.comments.some((c) => (c.content && c.content.trim()) || (Array.isArray(c.images) && c.images.length));
+    if (!embeddedHasReview && hasReviewData) {
+      o.comments.push({
+        id: uid(),
+        content: o.reviewContent || ((Array.isArray(o.reviewImages) && o.reviewImages.length) ? '[评价截图]' : ''),
+        images: Array.isArray(o.reviewImages) ? o.reviewImages.slice() : [],
+        submitDate: o.reviewSubmitDate || null,
+        source: 'order_sync', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      });
+      await putOne('orders', o);
+      filledEmbedded++;
+    }
+  }
+  const msg = `补建完成 ✓ 新建评论 ${createdStore} 条 · 更新 ${updatedStore} 条 · 补全订单内嵌评论 ${filledEmbedded} 条 · 跳过 ${skipped} 条（无订单号/无评价数据）`;
+  toast(msg, 'success');
+  console.log('[补建缺失评论]', msg);
+  render();
+}
+
 // 方向2：评论保存后，把评论信息回写到对应订单的顶层字段（双向同步）
 async function syncCommentReviewToOrder(comment) {
   if (!comment) return;
@@ -3865,6 +3952,7 @@ function bindCommentItem(paneEl, i, ctx) {
     const rec = await loadRecord(id);
     rec.comments.splice(i, 1);
     await syncCommentMirrors(rec, store);
+    if (store === 'orders') { try { await syncOrderReviewToComments(rec); } catch (e) { console.warn(e); } }
     toast('已删除评论', 'success');
     onChange();
     renderCommentManager(paneEl, ctx);
@@ -3877,6 +3965,7 @@ function bindCommentItem(paneEl, i, ctx) {
     rec.comments[i].submitDate = submitDate;
     rec.comments[i].updatedAt = new Date().toISOString();
     await syncCommentMirrors(rec, store);
+    if (store === 'orders') { try { await syncOrderReviewToComments(rec); } catch (e) { console.warn(e); } }
     toast('已保存', 'success');
     onChange();
   });
@@ -3885,6 +3974,7 @@ function bindCommentItem(paneEl, i, ctx) {
     const rec = await loadRecord(id);
     rec.comments[i].images.splice(j, 1);
     await syncCommentMirrors(rec, store);
+    if (store === 'orders') { try { await syncOrderReviewToComments(rec); } catch (e) { console.warn(e); } }
     onChange();
     renderCommentManager(paneEl, ctx);
   }));
@@ -3947,6 +4037,8 @@ async function renderCommentManager(paneEl, { store, id, loadRecord, onChange })
     if (!Array.isArray(r2.comments)) r2.comments = [];
     r2.comments.push({ id: uid(), content, images: imgs, submitDate, source: 'manual', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     await syncCommentMirrors(r2, store);
+    // 前向同步：订单 tab 新增的评论也写回评论管理页（comments 表）
+    if (store === 'orders') { try { await syncOrderReviewToComments(r2); } catch (e) { console.warn('sync to comments failed', e); } }
     toast('已添加评论', 'success');
     onChange();
     renderCommentManager(paneEl, { store, id, loadRecord, onChange });
