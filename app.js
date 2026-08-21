@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260820r';
+const APP_VERSION = '20260821b';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -1383,6 +1383,126 @@ function openDropdownConfig(key, col, onChange) {
 /* ============================================================
    DASHBOARD
    ============================================================ */
+/* ============================================================
+   仪表盘折叠组件 + 红人阶段看板 (v20260821a)
+   ============================================================ */
+const DASH_COLLAPSE_KEY = 'dash_collapse_v1';
+function getDashCollapse() { try { return JSON.parse(localStorage.getItem(DASH_COLLAPSE_KEY)) || {}; } catch (e) { return {}; } }
+function setDashCollapse(o) { try { localStorage.setItem(DASH_COLLAPSE_KEY, JSON.stringify(o)); } catch (e) {} }
+function collapseSection(key, title, bodyHtml, rightHtml) {
+  const collapsed = !!getDashCollapse()[key];
+  return `<section class="collapse-card">
+    <header class="collapse-head" data-collapse-toggle="${esc(key)}">
+      <span class="collapse-arrow">${collapsed ? '▸' : '▾'}</span>
+      <span class="collapse-title">${title}</span>
+      <span class="collapse-right">${rightHtml || ''}</span>
+    </header>
+    <div class="collapse-body" data-collapse-body="${esc(key)}" ${collapsed ? 'hidden' : ''}>${bodyHtml}</div>
+  </section>`;
+}
+
+/* 高对比状态配色（看板/漏斗通用） */
+const OUTREACH_COLORS = {
+  pending: '#475569', contacted: '#0ea5e9', confirmed: '#8b5cf6', guiding: '#f59e0b',
+  paid: '#22c55e', review_requested: '#ec4899', review_retry: '#ef4444', reviewed: '#14b8a6', abandoned: '#94a3b8'
+};
+
+/* 红人阶段看板 HTML */
+async function renderOutreachKanban() {
+  const leads = await getAll('leads');
+  const statusKeys = Object.keys(OUTREACH_STATUS);
+  const counts = {};
+  statusKeys.forEach((k) => (counts[k] = 0));
+  leads.forEach((l) => { counts[l.status] = (counts[l.status] || 0) + 1; });
+  const activeKeys = statusKeys.filter((k) => OUTREACH_STATUS[k].nextAction != null);
+  const terminalKeys = statusKeys.filter((k) => OUTREACH_STATUS[k].nextAction == null);
+
+  // 活跃态转化漏斗
+  const funnel = `<div class="kanban-funnel">${activeKeys.map((k, idx) => {
+    const c = OUTREACH_STATUS[k];
+    return `${idx > 0 ? '<span class="funnel-arrow">→</span>' : ''}<div class="funnel-item">
+      <span class="funnel-dot" style="background:${OUTREACH_COLORS[k]}"></span>
+      <span class="funnel-label">${esc(c.label)}</span>
+      <span class="funnel-num" style="color:${OUTREACH_COLORS[k]}">${counts[k] || 0}</span>
+    </div>`;
+  }).join('')}</div>`;
+
+  // 终止态底部汇总 + 总数
+  const term = `<div class="kanban-term">${terminalKeys.map((k) => `<span class="term-chip" style="background:${OUTREACH_COLORS[k]}">${esc(OUTREACH_STATUS[k].label)} ${counts[k] || 0}</span>`).join('')}<span class="term-total">共 ${leads.length} 位红人</span></div>`;
+
+  // 9列看板
+  const cols = statusKeys.map((k) => {
+    const cfg = OUTREACH_STATUS[k];
+    const items = leads.filter((l) => l.status === k);
+    const body = items.length ? items.map((l) => kanbanCard(l, k)).join('') : '<div class="kanban-empty">暂无</div>';
+    return `<div class="kanban-col" style="border-top-color:${OUTREACH_COLORS[k]}">
+      <div class="kanban-col-head"><span class="kanban-col-name">${esc(cfg.label)}</span><span class="kanban-col-count" style="background:${OUTREACH_COLORS[k]}">${items.length}</span></div>
+      <div class="kanban-col-body">${body}</div>
+    </div>`;
+  }).join('');
+
+  return `<div class="kanban-wrap">${funnel}${term}<div class="kanban-board">${cols}</div></div>`;
+}
+
+/* 最近动态：跨红人收集 commLog 时间线 */
+function timeAgo(ts) {
+  if (!ts) return '';
+  const d = new Date(String(ts).includes('T') ? ts : ts + 'T00:00:00');
+  if (isNaN(d.getTime())) return String(ts);
+  const diff = (Date.now() - d.getTime()) / 1000;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff / 60) + '分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + '小时前';
+  const days = Math.floor(diff / 86400);
+  if (days === 1) return '昨天';
+  if (days < 30) return days + '天前';
+  return (d.getMonth() + 1) + '/' + d.getDate();
+}
+
+async function renderRecentActivity() {
+  const leads = await getAll('leads');
+  const items = [];
+  leads.forEach((l) => {
+    (l.commLog || []).forEach((e) => {
+      items.push({
+        ts: e.ts || e.date || l.lastActionDate || '',
+        action: e.action || '',
+        detail: e.detail || '',
+        nick: l.nickname || '—',
+        status: l.status,
+        id: l.id,
+      });
+    });
+  });
+  items.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+  const top = items.slice(0, 14);
+  if (!top.length) return '<div class="ra-empty">暂无动态，去「红人跟进」添加或推进红人吧</div>';
+  return `<div class="ra-list">${top.map((it) => {
+    const col = OUTREACH_COLORS[it.status] || '#94a3b8';
+    return `<div class="ra-row" data-k-act="open" data-id="${esc(it.id)}" title="点击查看 ${esc(it.nick)}">
+      <span class="ra-dot" style="background:${col}"></span>
+      <div class="ra-main">
+        <div class="ra-line1"><span class="ra-nick">${esc(it.nick)}</span><span class="ra-action">${esc(it.action)}</span></div>
+        ${it.detail ? `<div class="ra-detail">${esc(it.detail)}</div>` : ''}
+      </div>
+      <span class="ra-time">${timeAgo(it.ts)}</span>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function kanbanCard(l, status) {
+  const trans = OUTREACH_TRANSITIONS[status] || [];
+  const advance = trans.length
+    ? `<button class="k-chip k-advance" data-k-act="advance" data-id="${esc(l.id)}" data-to="${esc(trans[0].to)}">${esc(trans[0].label)} →</button>`
+    : `<span class="k-done">已完成</span>`;
+  return `<div class="kanban-card" data-k-act="open" data-id="${esc(l.id)}">
+    <div class="k-nick">${esc(l.nickname || '—')}</div>
+    <div class="k-meta">${platformIcon(l.platform)} ${esc(l.country || '—')}</div>
+    ${l.product ? `<div class="k-product">${esc(l.product)}</div>` : ''}
+    <div class="k-actions">${advance}<button class="k-chip k-del" data-k-act="del" data-id="${esc(l.id)}" title="删除">✕</button></div>
+  </div>`;
+}
+
 async function renderDashboard(c) {
   const [customers, orders, settlements] = await Promise.all([getAll('customers'), getAll('orders'), getAll('settlements')]);
   const now = new Date();
@@ -1425,7 +1545,57 @@ async function renderDashboard(c) {
 
   const recent = [...orders].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)).slice(0, 5);
 
-  c.innerHTML = `<div class="maxw">
+  const kanbanHtml = await renderOutreachKanban();
+  const activityHtml = await renderRecentActivity();
+  const dashStyle = `<style>
+    .collapse-card { border:1px solid #eaeaea; border-radius:12px; margin-top:16px; background:#fff; overflow:hidden; }
+    .collapse-head { display:flex; align-items:center; gap:8px; padding:13px 16px; cursor:pointer; user-select:none; background:#fafafa; }
+    .collapse-head:hover { background:#f3f3f3; }
+    .collapse-arrow { font-size:12px; color:#888; }
+    .collapse-title { font-size:15px; font-weight:700; flex:1; }
+    .collapse-right { font-size:13px; }
+    .collapse-body { padding:16px; }
+    .collapse-body[hidden] { display:none; }
+    .kanban-funnel { display:flex; align-items:center; flex-wrap:wrap; gap:4px 0; margin-bottom:12px; padding:10px 12px; background:#f8f9fb; border-radius:10px; }
+    .funnel-item { display:inline-flex; align-items:center; gap:5px; padding:4px 10px; font-size:13px; font-weight:600; }
+    .funnel-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+    .funnel-num { font-size:15px; font-weight:800; }
+    .funnel-arrow { color:#cbd5e1; font-size:13px; padding:0 2px; }
+    .kanban-term { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+    .term-chip { color:#fff; font-size:12px; font-weight:600; padding:5px 12px; border-radius:20px; }
+    .term-total { margin-left:auto; font-size:13px; color:#64748b; font-weight:600; }
+    .kanban-board { display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; }
+    .kanban-col { flex:0 0 168px; background:#fbfbfc; border:1px solid #eef0f2; border-top:3px solid #ccc; border-radius:10px; padding:8px; min-height:120px; }
+    .kanban-col-head { display:flex; align-items:center; justify-content:space-between; font-size:13px; font-weight:700; margin-bottom:8px; }
+    .kanban-col-count { color:#fff; font-size:11px; font-weight:700; min-width:20px; height:20px; border-radius:10px; display:inline-flex; align-items:center; justify-content:center; padding:0 6px; }
+    .kanban-col-body { display:flex; flex-direction:column; gap:8px; }
+    .kanban-card { background:#fff; border:1px solid #e9e9ec; border-radius:9px; padding:9px; cursor:pointer; transition:box-shadow .12s, transform .12s; }
+    .kanban-card:hover { box-shadow:0 2px 10px rgba(0,0,0,.08); transform:translateY(-1px); }
+    .k-nick { font-size:13px; font-weight:700; margin-bottom:3px; }
+    .k-meta { font-size:11px; color:#888; margin-bottom:4px; }
+    .k-product { font-size:11px; color:#555; background:#f3f4f6; border-radius:5px; padding:2px 6px; margin-bottom:6px; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .k-actions { display:flex; gap:5px; align-items:center; }
+    .k-chip { font-size:11px; padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer; white-space:nowrap; }
+    .k-advance { color:#fff; border:none; background:#111; font-weight:600; }
+    .k-advance:hover { background:#333; }
+    .k-del { color:#dc2626; border-color:#dc2626; }
+    .k-del:hover { background:#fef2f2; }
+    .k-done { font-size:11px; color:#16a34a; font-weight:600; }
+    .kanban-empty { font-size:12px; color:#bbb; text-align:center; padding:14px 0; }
+    .ra-list { display:flex; flex-direction:column; gap:2px; }
+    .ra-row { display:flex; align-items:flex-start; gap:10px; padding:9px 8px; border-radius:8px; cursor:pointer; transition:background .12s; }
+    .ra-row:hover { background:#f6f7f9; }
+    .ra-dot { width:9px; height:9px; border-radius:50%; margin-top:5px; flex:0 0 auto; }
+    .ra-main { flex:1; min-width:0; }
+    .ra-line1 { font-size:13px; display:flex; gap:6px; align-items:baseline; flex-wrap:wrap; }
+    .ra-nick { font-weight:700; color:#1f2937; }
+    .ra-action { color:#475569; font-size:12px; }
+    .ra-detail { font-size:12px; color:#94a3b8; margin-top:2px; }
+    .ra-time { font-size:11px; color:#cbd5e1; white-space:nowrap; flex:0 0 auto; margin-top:2px; }
+    .ra-empty { font-size:13px; color:#bbb; text-align:center; padding:20px 0; }
+  </style>`;
+
+  c.innerHTML = `${dashStyle}<div class="maxw">
     <div class="dash-title">核心指标概览与业务趋势分析</div>
     <div class="stat-grid">
       <div class="stat" data-stat="customers" style="cursor:pointer" title="点击查看客户明细"><div class="stat-head"><span class="label">总客户数</span><span class="stat-ico">☺</span></div><div class="value">${fmtInt(totalCustomers)}</div><div class="sub">Customers</div></div>
@@ -1433,7 +1603,7 @@ async function renderDashboard(c) {
       <div class="stat" data-stat="monthlyNew" style="cursor:pointer" title="点击查看本月新增客户"><div class="stat-head"><span class="label">本月新增客户</span><span class="stat-ico">✚</span></div><div class="value">${fmtInt(monthlyNewCustomers)}</div><div class="sub">This Month</div></div>
       <div class="stat" data-stat="monthlyTable" style="cursor:pointer" title="查看月度统计明细"><div class="stat-head"><span class="label">近12月新增客户</span><span class="stat-ico">📈</span></div><div class="value">${fmtInt(monthlySummary.reduce((s, m) => s + m.newCustomers, 0))}</div><div class="sub">累计 (人)</div></div>
     </div>
-    <div class="chart-grid">
+    ${collapseSection('dist', '📊 分布概览 · 国家 & 店铺', `<div class="chart-grid">
       <div class="chart-box">
         <h4>国家客户分布</h4>
         <div class="chart-toolbar"><button class="btn btn-sm" id="cty-reset">⟲ 重置视图</button><button class="btn btn-sm" id="cty-all">显示全部</button></div>
@@ -1444,8 +1614,8 @@ async function renderDashboard(c) {
         <div class="chart-toolbar"><button class="btn btn-sm" id="store-reset">⟲ 重置视图</button></div>
         <div class="chart-canvas-wrap"><canvas id="storeChart"></canvas></div>
       </div>
-    </div>
-    <div class="chart-grid" style="grid-template-columns:1fr">
+    </div>`)}\n
+    ${collapseSection('trend', '📈 月度订单与新增客户趋势', `<div class="chart-grid" style="grid-template-columns:1fr">
       <div class="chart-box">
         <h4>月度订单与新增客户趋势</h4>
         <div class="chart-toolbar">
@@ -1458,17 +1628,24 @@ async function renderDashboard(c) {
         </div>
         <div class="chart-canvas-wrap"><canvas id="trendChart"></canvas></div>
       </div>
-    </div>
-    <div class="card mt"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">📊 月度统计明细（近12个月）</h4>
+    </div>`)}
+
+    ${collapseSection('monthly', '📋 月度统计明细（近12个月）', `<div class="card mt" style="margin-top:0"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">📊 月度统计明细（近12个月）</h4>
       <div class="table-wrap"><table class="data"><thead><tr><th>月份</th><th class="num">新增客户</th><th class="num">订单数</th></tr></thead><tbody>
         ${monthlySummary.map((m) => `<tr><td>${esc(m.month)}</td><td class="num">${fmtInt(m.newCustomers)}</td><td class="num">${fmtInt(m.orderCount)}</td></tr>`).join('')}
       </tbody></table></div>
-    </div>
-    <div class="card mt"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">最近订单</h4>
+    </div>`)}
+
+    ${collapseSection('kanban', '🎯 红人阶段看板', kanbanHtml, '<button class="btn btn-sm" data-go="outreach">跳转红人跟进 →</button>')}
+
+    ${collapseSection('activity', '🔔 最近动态', activityHtml, '<button class="btn btn-sm" data-go="outreach">查看全部 →</button>')}
+
+    ${collapseSection('recent', '🧾 最近订单', `<div class="card mt" style="margin-top:0"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">最近订单</h4>
       ${recent.length ? `<div class="table-wrap"><table class="data"><thead><tr><th>订单号</th><th>客户</th><th>店铺</th><th>产品</th><th class="num">金额</th><th>状态</th><th>日期</th></tr></thead><tbody>
         ${recent.map((o) => `<tr style="cursor:pointer" data-order="${o.id}"><td class="mono">${esc(o.orderNumber)}</td><td>${esc(o.customerName)}</td><td>${esc(o.store)}</td><td class="cell-ellipsis">${esc(o.product)}</td><td class="num">${fmtAmount(o.amount, o.currency || o.country)}</td><td>${statusBadge(o.status)}</td><td>${fmtDate(o.orderDate)}</td></tr>`).join('')}
       </tbody></table></div>` : '<div class="empty">暂无订单数据</div>'}
-    </div>
+    </div>`)}
+
   </div>`;
 
   $$('tr[data-order]', c).forEach((tr) => tr.addEventListener('click', (e) => { e.stopPropagation(); openOrderDetail(tr.dataset.order); }));
@@ -1492,6 +1669,42 @@ async function renderDashboard(c) {
   }));
   const trendReset = $('#trend-reset');
   if (trendReset) trendReset.addEventListener('click', () => { state.charts.trendRange = null; renderDashboard(c); });
+
+  // 折叠卡片 toggle
+  $$('[data-collapse-toggle]', c).forEach((h) => h.addEventListener('click', () => {
+    const key = h.dataset.collapseToggle;
+    const body = $(`[data-collapse-body="${key}"]`, c);
+    const arrow = $('.collapse-arrow', h);
+    const cur = getDashCollapse();
+    const nowCollapsed = !cur[key];
+    cur[key] = nowCollapsed;
+    setDashCollapse(cur);
+    if (body) body.hidden = nowCollapsed;
+    if (arrow) arrow.textContent = nowCollapsed ? '▸' : '▾';
+    if (!nowCollapsed) {
+      setTimeout(() => { Object.values(state.charts).forEach((ch) => { try { ch.resize(); } catch (e) {} }); }, 40);
+    }
+  }));
+
+  // 看板：跳转红人跟进
+  $$('[data-go="outreach"]', c).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); navigate('outreach'); }));
+
+  // 看板卡片操作（委托：点按钮取最近 data-k-act，避免冒泡到卡片 open）
+  c.addEventListener('click', async (e) => {
+    const t = e.target.closest('[data-k-act]');
+    if (!t) return;
+    const act = t.dataset.kAct;
+    const id = t.dataset.id;
+    if (act === 'open') {
+      const lead = (await getAll('leads')).find((x) => x.id === id);
+      if (lead) openLeadForm(lead);
+    } else if (act === 'advance') {
+      await transitionLead(id, t.dataset.to);
+    } else if (act === 'del') {
+      e.stopPropagation();
+      deleteLead(id);
+    }
+  });
 }
 async function openStatDetail(type) {
   const customers = await getAll('customers');
@@ -4462,24 +4675,24 @@ async function renderOutreach(c, keepScroll) {
     .o-act-btn.danger { color:#dc2626; border-color:#dc2626; }
     .o-act-btn.danger:hover { background:#fef2f2; }
     /* status-colored action buttons */
-    .o-act-btn.st-pending { background:#6b7280; color:#fff; border-color:#6b7280; }
-    .o-act-btn.st-pending:hover { background:#4b5563; }
-    .o-act-btn.st-contacted { background:#2563eb; color:#fff; border-color:#2563eb; }
-    .o-act-btn.st-contacted:hover { background:#1d4ed8; }
-    .o-act-btn.st-confirmed { background:#4f46e5; color:#fff; border-color:#4f46e5; }
-    .o-act-btn.st-confirmed:hover { background:#4338ca; }
-    .o-act-btn.st-guiding { background:#ea580c; color:#fff; border-color:#ea580c; }
-    .o-act-btn.st-guiding:hover { background:#c2410c; }
-    .o-act-btn.st-paid { background:#16a34a; color:#fff; border-color:#16a34a; }
-    .o-act-btn.st-paid:hover { background:#15803d; }
-    .o-act-btn.st-review_requested { background:#db2777; color:#fff; border-color:#db2777; }
-    .o-act-btn.st-review_requested:hover { background:#be185d; }
-    .o-act-btn.st-review_retry { background:#dc2626; color:#fff; border-color:#dc2626; }
-    .o-act-btn.st-review_retry:hover { background:#b91c1c; }
-    .o-act-btn.st-reviewed { background:#059669; color:#fff; border-color:#059669; }
-    .o-act-btn.st-reviewed:hover { background:#047857; }
-    .o-act-btn.st-abandoned { background:#9ca3af; color:#fff; border-color:#9ca3af; }
-    .o-act-btn.st-abandoned:hover { background:#6b7280; }
+    .o-act-btn.st-pending { background:#475569; color:#fff; border-color:#475569; }
+    .o-act-btn.st-pending:hover { background:#334155; }
+    .o-act-btn.st-contacted { background:#0ea5e9; color:#fff; border-color:#0ea5e9; }
+    .o-act-btn.st-contacted:hover { background:#0284c7; }
+    .o-act-btn.st-confirmed { background:#8b5cf6; color:#fff; border-color:#8b5cf6; }
+    .o-act-btn.st-confirmed:hover { background:#7c3aed; }
+    .o-act-btn.st-guiding { background:#f59e0b; color:#fff; border-color:#f59e0b; }
+    .o-act-btn.st-guiding:hover { background:#d97706; }
+    .o-act-btn.st-paid { background:#22c55e; color:#fff; border-color:#22c55e; }
+    .o-act-btn.st-paid:hover { background:#16a34a; }
+    .o-act-btn.st-review_requested { background:#ec4899; color:#fff; border-color:#ec4899; }
+    .o-act-btn.st-review_requested:hover { background:#db2777; }
+    .o-act-btn.st-review_retry { background:#ef4444; color:#fff; border-color:#ef4444; }
+    .o-act-btn.st-review_retry:hover { background:#dc2626; }
+    .o-act-btn.st-reviewed { background:#14b8a6; color:#fff; border-color:#14b8a6; }
+    .o-act-btn.st-reviewed:hover { background:#0d9488; }
+    .o-act-btn.st-abandoned { background:#94a3b8; color:#fff; border-color:#94a3b8; }
+    .o-act-btn.st-abandoned:hover { background:#64748b; }
     .o-empty { text-align:center; padding:40px; color:#999; font-size:14px; }
     .msg-card { border:1px solid #e5e5e5; border-radius:10px; padding:16px; margin-bottom:14px; }
     .msg-card h4 { font-size:14px; font-weight:700; margin-bottom:8px; }
@@ -4694,12 +4907,18 @@ function openLeadForm(lead) {
     if (!data.nickname) { toast('请填写昵称', 'error'); return; }
     if (isEdit) {
       data.id = lead.id;
-      data.status = $('#lf-status') ? $('#lf-status').value : lead.status;
-      data.lastActionDate = lead.lastActionDate || lead.createdAt;
+      const newStatus = $('#lf-status') ? $('#lf-status').value : lead.status;
+      const statusChanged = newStatus !== lead.status;
+      data.status = newStatus;
+      data.lastActionDate = statusChanged ? new Date().toISOString() : (lead.lastActionDate || lead.createdAt);
       data.createdAt = lead.createdAt;
       data.updatedAt = new Date().toISOString();
       data.reminderDays = $('#lf-days') ? $('#lf-days').value : lead.reminderDays;
       data.commLog = lead.commLog || [];
+      if (statusChanged) {
+        const ts = new Date().toISOString();
+        data.commLog.push({ ts, date: ts.slice(0, 10), action: `状态: ${OUTREACH_STATUS[lead.status]?.label || lead.status} → ${OUTREACH_STATUS[newStatus]?.label || newStatus}`, detail: '通过编辑表单修改' });
+      }
       await putOne('leads', data);
       toast('已保存', 'success');
     } else {
@@ -4709,7 +4928,7 @@ function openLeadForm(lead) {
       data.lastActionDate = now;
       data.createdAt = now;
       data.updatedAt = now;
-      data.commLog = [{ date: now.slice(0, 10), action: '创建', detail: '新发现红人' }];
+      data.commLog = [{ ts: now, date: now.slice(0, 10), action: '创建', detail: '新发现红人' }];
       await putOne('leads', data);
       toast('已创建，状态：待开发', 'success');
     }
@@ -4863,6 +5082,7 @@ async function transitionLead(id, newStatus) {
   lead.updatedAt = now;
   if (!lead.commLog) lead.commLog = [];
   lead.commLog.push({
+    ts: now,
     date: now.slice(0, 10),
     action: `状态: ${OUTREACH_STATUS[oldStatus]?.label || oldStatus} → ${cfg.label}`,
     detail: cfg.nextAction ? `下一步: ${cfg.nextAction}` : '终止',
