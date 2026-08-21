@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260821f';
+const APP_VERSION = '20260821g';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -5074,152 +5074,327 @@ function openLeadForm(lead, opts = {}) {
 
 /* ---------- 🤖 AI 录入（粘贴聊天→提取→填表）---------- */
 
-// 本地正则兜底提取：无 AI Key 时也能抓出明显字段
+// 本地正则兜底提取 v2：语义级准确率（邮件结构感知 + 多信号综合判断）
 function localExtract(text, kind) {
   const t = text || '';
   const out = {};
   const s = getOutreachSettings();
-  // 操作员自邮列表（提取客户邮箱时自动跳过）
-  const selfEmails = (s._selfEmails || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
-  const isSelfEmail = (addr) => selfEmails.includes(addr.toLowerCase());
+  const selfEmails = (s._selfEmails || 'anna@ibayaqua.com').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+  const isSelf = (addr) => selfEmails.includes(addr.toLowerCase());
 
-  // ═══ 邮箱（排除操作员自己的邮箱）═══
-  const allEmails = (t.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || []);
-  // 过滤掉自邮，取第一个非自邮的作为客户邮箱
-  const customerEmail = allEmails.find(e => !isSelfEmail(e)) || '';
+  // ════════════════════════════════════════
+  // §1  邮件结构解析（From/To/Subject/时间线）
+  // ════════════════════════════════════════
+  // 支持中英文邮件头：From / 发件人 / To / 收件人 / Subject / 主题
+  const fromMatch = t.match(/(?:From|发件人)[:\s]*\n?\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]*)\s*(?:<([^>]+)>)?/im)
+    || t.match(/(?:From|发件人)[:\s]*([^\n<]+?)(?:<([^>]+)>)?/i);
+  const toMatches = [...t.matchAll(/(?:To|收件人)[:\s]*\n?\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]*)\s*(?:<([^>]+)>)/gi)];
+  const subjMatch = t.match(/(?:Subject|主题)[:\s]*(.*?)(?:\n|$)/i);
+  const senderName = fromMatch ? (fromMatch[1] || '').trim() : '';
+  const senderEmail = fromMatch && fromMatch[2] ? fromMatch[2].trim().toLowerCase() : '';
+  const subjectLine = subjMatch ? subjMatch[1].trim() : '';
+
+  // 从 Subject 提取国家（最高优先级）
+  let subjCountry = '';
+  if (subjectLine) {
+    const cm = subjectLine.match(/\b(US|UK|DE|AU|CA|FR|IT|ES|JP)\b/i);
+    if (cm) { const m = { us:'US', uk:'UK', de:'DE', au:'AU', ca:'CA', fr:'FR', it:'IT', es:'ES', jp:'JP' }; subjCountry = m[cm[1].toLowerCase()] || cm[1].toUpperCase(); }
+  }
+
+  // ════════════════════════════════════════
+  // §2  客户邮箱（结构优先 > 自邮过滤）
+  // ════════════════════════════════════════
+  let customerEmail = '';
+  // 优先级A: From 头中的发件人邮箱（客户发来的邮件中，From就是客户）
+  if (senderEmail && !isSelf(senderEmail)) customerEmail = senderEmail;
+  // 优先级B: To 头中非自邮的第一个收件人
+  if (!customerEmail) {
+    for (const tm of toMatches) { const te = tm[2].trim().toLowerCase(); if (!isSelf(te)) { customerEmail = tm[2].trim(); break; } }
+  }
+  // 优先级C: 全文所有邮箱排除自邮
+  if (!customerEmail) {
+    const allEmails = (t.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || []);
+    customerEmail = allEmails.find(e => !isSelf(e)) || '';
+  }
   if (customerEmail) {
     if (kind === 'order') out.customerEmail = customerEmail;
     else out.email = customerEmail;
   }
 
-  // ═══ URL 分类（区分电商链接 vs 社媒主页）═══
+  // ════════════════════════════════════════
+  // §3  订单号（严格格式优先，拒绝纯英文单词）
+  // ════════════════════════════════════════
+  let orderNumber = '';
+  // 模式A: Amazon 标准格式 111-8333069-5627461（最高可信度）
+  const amazonOnum = t.match(/\b(\d{3}-\d{7}-\d{7})\b/);
+  if (amazonOnum) orderNumber = amazonOnum[1];
+  // 模式B: Order # / order number 后跟数字开头
+  if (!orderNumber) {
+    const hashM = t.match(/(?:Order\s*#\s*|#\s*)(\d[\d-]{8,})/i);
+    if (hashM) orderNumber = hashM[1];
+  }
+  if (!orderNumber) {
+    const labelM = t.match(/(?:order\s+number\s*(?:is|=|:)\s*)(\d[\d-]{8,})/i);
+    if (labelM) orderNumber = labelM[1];
+  }
+  // 模式C: 中文「订单号」后跟数字
+  if (!orderNumber) {
+    const cnM = t.match(/(?:订单号[号：:\s]*)(\d[\d-]{8,})/i);
+    if (cnM) orderNumber = cnM[1];
+  }
+  // 安全检查：结果必须以数字开头且包含至少6位数字（排除 "number" 等纯英文词）
+  if (orderNumber && !/^\d/.test(orderNumber)) orderNumber = '';
+  if (orderNumber && !/\d{6}/.test(orderNumber)) orderNumber = '';
+  if (orderNumber) out.orderNumber = orderNumber;
+
+  // ════════════════════════════════════════
+  // §4  客户名（From头 > 签名 > 称呼）
+  // ════════════════════════════════════════
+  let customerName = '';
+  // A: From 头的名字（最可靠）
+  if (senderName && !/anna|ibay/i.test(senderName)) customerName = senderName.trim();
+  // B: 邮件签名（过滤掉操作员签名，取客户签名）
+  if (!customerName) {
+    // 找所有签名，排除 Anna/IBAY 的，取最后一个客户签名
+    const allSigs = [...t.matchAll(/(?:Best regards|Regards|Thanks|Cheers|Thank you|Kind regards)[\s\S]{0,6}\n\s*([-–—\s]*)([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,30}?)(?:\n|$)/gi)];
+    const customerSigs = allSigs.filter(sig => { const n = (sig[2] || '').trim(); return n && !/anna|ibay/i.test(n); });
+    if (customerSigs.length) {
+      customerName = customerSigs[customerSigs.length - 1][2].trim();
+    }
+    // 兜底：独立行 "-XXX" 或 "XXX" 在邮件末尾附近
+    if (!customerName) {
+      const dashSig = t.match(/(?:^|\n)\s*[-–—]\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{2,30}?)\s*(?:\n|$)/);
+      if (dashSig && !/anna|ibay/i.test(dashSig[1])) customerName = dashSig[1].trim();
+    }
+  }
+  // C: "Hi XXX," 称呼（取客户的称呼，不是Anna称呼别人的）
+  if (!customerName) {
+    // 在客户消息块中找 "Hi Anna," 这种——但我们要的是别人叫客户什么
+    // 实际上客户发的邮件里开头的 Hi/Hello 后面跟的是操作员名，所以这个模式对提取客户名不太适用
+    // 但如果操作员写的邮件中有 "Hi Timmy," 那可以提取
+    const hiM = t.match(/^(?:Hi|Hello|Hey|Dear)\s+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)[,，]/im);
+    if (hiM) { const n = hiM[1].trim(); if (n && !/anna|ibay/i.test(n)) customerName = n; }
+  }
+  // D: "My name is XXX"
+  if (!customerName) {
+    const nameM = t.match(/(?:My name is|I'm|This is|I am)\s+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|\.|,|$)/i);
+    if (nameM) { const n = nameM[1].trim(); if (!/anna|ibay/i.test(n)) customerName = n; }
+  }
+  if (customerName) {
+    if (kind === 'lead') out.nickname = customerName;
+    else out.customerName = customerName;
+  } else if (kind === 'lead' && customerEmail) {
+    const at = customerEmail.match(/@([\w.]{3,30})/);
+    if (at) out.nickname = at[1];
+  }
+
+  // ════════════════════════════════════════
+  // §5  产品名（编号列表 > 关键词 > Amazon链接旁）
+  // ════════════════════════════════════════
+  let product = '';
+  // A: 编号列表 "1. Product Name" 或 "1.3W XXX"
+  const listM = t.match(/(?:^|\n)\d+\.\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-/]{2,45}?)(?:\n|$|https?:|$)/i);
+  if (listM) product = listM[1].trim().replace(/\s*[（(].*[）)]\s*$/, '');
+  // B: "this product" / "the filter" / "the feeder" 等指代 + 前文产品名
+  if (!product) {
+    const prodM = t.match(/(?:产品|product|item|this product)[:：\s]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{2,35}?)(?:\n|$|\.|,|https?:)/i);
+    if (prodM) product = prodM[1].trim();
+  }
+  // C: Amazon 链接正上方的文字
+  if (!product) {
+    const amznM = t.match(/([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{2,40}?)\s*\n\s*https?:\/\/(?:amzn\.to|amazon\.com\/|amzn\.eu)/i);
+    if (amznM) product = amznM[1].trim().replace(/^\d+\.\s*/, '');
+  }
+  // D: Subject 中可能含产品名
+  if (!product && subjectLine) {
+    const spM = subjectLine.match(/\|\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{2,40}?)\s*$/);
+    if (spM) product = spM[1].trim();
+  }
+  if (product) out.product = product;
+
+  // ════════════════════════════════════════
+  // §6  金额 + 货币
+  // ════════════════════════════════════════
+  const curMap = [['£', 'GBP'], ['\\$', 'USD'], ['€', 'EUR'], ['¥', 'CNY'], ['￥', 'CNY']];
+  let currency = '', amount = '';
+  for (const [sym, code] of curMap) {
+    const m = t.match(new RegExp(sym + '\\s?(\\d+(?:[.,]\\d{1,2})?)'));
+    if (m) { currency = code; amount = m[1].replace(',', '.'); break; }
+  }
+  if (!amount) {
+    const m = t.match(/(\d+(?:[.,]\\d{1,2})?)\\s*(?:usd|eur|gbp|cny|rmb|美元|欧|镑)/i);
+    if (m) { amount = m[1].replace(',', '.'); currency = 'USD'; }
+  }
+  if (amount) { out.amount = amount; out.currency = currency || 'USD'; }
+
+  // ════════════════════════════════════════
+  // §7  国家（Subject > 正文 > 默认）
+  // ════════════════════════════════════════
+  let country = subjCountry;
+  if (!country) {
+    // 用更严格的上下文匹配国家全称（避免 "I'd" → IT 这类误匹配）
+    const ctryPatterns = [
+      [/\bUnited States\b/i, 'US'], [/\bUSA\b(?!P)/i, 'US'],
+      [/\bUnited Kingdom\b/i, 'UK'], [/\bUK\b(?!\s*Product Testing)/i, 'UK'],  // 但 "UK Product Testing" 应该匹配UK
+      [/\bGermany\b/i, 'DE'], [/\bAustralia\b/i, 'AU'],
+      [/\bCanada\b/i, 'CA'], [/\bFrance\b/i, 'FR'],
+      [/\bItaly\b/i, 'IT'], [/\bSpain\b/i, 'ES'], [/\bJapan\b/i, 'JP'],
+    ];
+    // 特殊处理：邮件主题或正文中的 "XX Product Testing Campaign" 格式
+    const campM = t.match(/\b(US|UK|DE|AU|CA|FR|IT|ES|JP)\b\s+Product\s+Testing/i);
+    if (campM) { const cm2 = { us:'US', uk:'UK', de:'DE', au:'AU', ca:'CA', fr:'FR', it:'IT', es:'ES', jp:'JP' }; country = cm2[campM[1].toLowerCase()] || campM[1].toUpperCase(); }
+    if (!country) {
+      for (const [pat, code] of ctryPatterns) { if (pat.test(t)) { country = code; break; } }
+    }
+  }
+  if (country) out.country = country;
+
+  // ════════════════════════════════════════
+  // §8  店铺（根据国家推断）
+  // ════════════════════════════════════════
+  // 先尝试显式匹配
+  const storeM = t.match(/\b((?:HS|IB)[-\s]?(?:US|UK|DE|AU|CA|FR|IT|ES))\b/i);
+  if (storeM) out.store = storeM[1].toUpperCase().replace(/\s/, '-');
+  // 否则根据国家推断默认店铺
+  else if (country) out.store = 'HS-' + country;
+
+  // ════════════════════════════════════════
+  // §9  返款方式（多信号综合判断）
+  // ════════════════════════════════════════
+  // 信号收集
+  const signals = {
+    paypalChosen: false,     // 客户明确选了PayPal
+    amazonRefundChosen: false, // 客户明确选了平台退款
+    paypalMentioned: false,   // 提到了PayPal（但不一定是选择）
+    refundDone: false,        // 已完成退款
+    receivedPayment: false,   // 客户确认收到付款
+  };
+  
+  // 检测客户明确选择了PayPal（必须是一人称选择语句，排除模板介绍性文字）
+  const paypalChosenRe = new RegExp(
+    "(?:I[']?d (?:go with|choose|prefer)" +
+    "|I think.*PayPal.*(?:prefer|convenient|good|best)" +
+    "|PayPal (?:option )?would be (?:the )?most convenient" +
+    "|for me.*PayPal)", 'i');
+  if (paypalChosenRe.test(t)) {
+    signals.paypalChosen = true;
+  }
+  // 检测客户明确选择了Amazon平台退款（选项2）
+  if (/(?:option\s*2|second option|选项二|第二.*选项|will go with the second|order through amazon.*then provide|provide.*order number.*after|platform refund|chose.*(?:second|option\s*2))/i.test(t)) {
+    signals.amazonRefundChosen = true;
+  }
+  // 检测提到PayPal
+  if (/paypal/i.test(t)) signals.paypalMentioned = true;
+  // 检测已退款/已收到款
+  if (/(?:received (?:the )?payment|received it successfully|payment has been (?:sent|transferred)|refund.*processed|full refund)/i.test(t)) {
+    signals.refundDone = true;
+    signals.receivedPayment = true;
+  }
+
+  // 综合判断（优先级：明确选项选择 > 上下文推断 > 弱信号）
+  // 最高优先：客户明确选了平台退款（选项2）
+  if (signals.amazonRefundChosen && !signals.paypalChosen) {
+    out.refundMethod = '平台退款';
+  }
+  // 第二优先：客户明确选了PayPal
+  else if (signals.paypalChosen && !signals.amazonRefundChosen) {
+    out.refundMethod = 'PayPal';
+    if (customerEmail) out.ppAccount = customerEmail;
+  }
+  // 第三优先：两个都检测到（冲突）→ 取更具体的选项指示词
+  else if (signals.amazonRefundChosen && signals.paypalChosen) {
+    // "second option" / "option 2" 比 PayPal 泛提更具体 → 平台退款
+    if (/second option|option\s*2|选项二/i.test(t)) out.refundMethod = '平台退款';
+    else { out.refundMethod = 'PayPal'; if (customerEmail) out.ppAccount = customerEmail; }
+  }
+  // 第四优先：已收到付款 + 提到PayPal → PayPal（已执行）
+  else if (signals.refundDone && signals.paypalMentioned) {
+    out.refundMethod = 'PayPal';
+    if (customerEmail) out.ppAccount = customerEmail;
+  }
+  // 第五优先：仅提到PayPal（弱信号）
+  else if (signals.paypalMentioned) {
+    out.refundMethod = 'PayPal';
+    if (customerEmail) out.ppAccount = customerEmail;
+  } else if (/银行|bank\s*transfer/i.test(t)) {
+    out.refundMethod = '银行转账';
+  }
+
+  // ════════════════════════════════════════
+  // §10  URL 分类（电商 vs 社媒）
+  // ════════════════════════════════════════
   const ECOM_DOMAINS = ['amazon', 'amzn', 'ebay', 'aliexpress', 'temu', 'shein', 'walmart', 'target', 'bestbuy'];
   const allUrls = (t.match(/https?:\/\/[^\s)'"]+/gi) || []);
-  // 找第一个非电商URL作为社媒/主页链接
   const socialUrl = allUrls.find(u => !ECOM_DOMAINS.some(d => u.toLowerCase().includes(d))) || '';
   if (socialUrl) {
     if (kind === 'order') out.socialMediaUrl = socialUrl;
     else out.profileUrl = socialUrl;
   }
 
-  // ═══ 平台识别（从内容语义判断，而非仅关键词命中）═══
-  const lower = t.toLowerCase();
+  // ════════════════════════════════════════
+  // §11  平台识别
+  // ════════════════════════════════════════
   let platform = '';
-  // 更严格的匹配：需要是"在XX平台发帖/发视频"的语境
-  if (/\btiktok\b.*(?:video|post|review|account|profile|@)/i.test(t) || /(?:video|review|content).*\btiktok\b/i.test(t)) platform = 'TikTok';
-  else if (/\binstagram\b.*(?:post|reel|account|profile|@)/i.test(t) || /(?:post|reel|photo).*\binstagram\b/i.test(t)) platform = 'Instagram';
-  else if (/\byoutube\b.*(?:video|channel|review)/i.test(t) || /(?:video|review).*\byoutube\b/i.test(t)) platform = 'YouTube';
-  else if (/\bfacebook\b.*(?:page|group|post)/i.test(t)) platform = 'Facebook';
-  else if (/\bpinterest\b/i.test(t)) platform = 'Pinterest';
-  else if (/\breddit\b/i.test(t)) platform = 'Reddit';
-  else if (/\bblog\b/i.test(t)) platform = 'Blog';
-  // 如果全文只提到一次TikTok且是在"will provide a TikTok video"这种承诺语境中，也标记
-  if (!platform && /\btiktok\b/i.test(t)) platform = 'TikTok';
+  if (/\btiktok\b.*(video|review|post|account)/i.test(t) || /(video|review).*\btiktok\b/i.test(t) || /\btiktok\b/i.test(t)) platform = 'TikTok';
+  else if (/\binstagram\b.*(post|reel|account)/i.test(t) || /\binstagram\b/i.test(t)) platform = 'Instagram';
+  else if (/\byoutube\b.*(video|channel)/i.test(t) || /\byoutube\b/i.test(t)) platform = 'YouTube';
+  else if (/\bfacebook\b/i.test(t)) platform = 'Facebook';
   if (platform) out.platform = platform;
 
-  // ═══ 金额 + 货币 ═══
-  const curMap = [['¥', 'CNY'], ['￥', 'CNY'], ['RMB', 'CNY'], ['CNY', 'CNY'], ['€', 'EUR'], ['EUR', 'EUR'], ['£', 'GBP'], ['GBP', 'GBP'], ['\\$', 'USD'], ['USD', 'USD']];
-  let cur = '', amt = '';
-  for (const [sym, code] of curMap) {
-    const m = t.match(new RegExp(sym + '\\s?(\\d+(?:[.,]\\d{1,2})?)'));
-    if (m) { cur = code; amt = m[1].replace(',', '.'); break; }
-  }
-  if (!amt) { const m = t.match(/(?:^|\s)(\d+(?:[.,]\d{1,2})?)\s*(?:usd|eur|gbp|cny|rmb|美元|欧|镑)/i); if (m) { amt = m[1].replace(',', '.'); cur = (m[2] || '').toUpperCase() || 'USD'; } }
-  if (amt) { out.amount = amt; out.currency = cur || 'USD'; }
-
-  // ═══ 订单号 ═══
-  const onum = (t.match(/#\s?([A-Za-z0-9][\w-]{4,})/))
-    || (t.match(/(?:订单号|order\s*(?:#|no)?\.?\s*[:：]?\s*)([A-Za-z0-9][\w-]{4,})/i))
-    || (t.match(/\b(\d{3}-\d{7}-\d{7})\b/));  // Amazon格式 111-8333069-5627461
-  if (onum) out.orderNumber = onum[1];
-
-  // ═══ 店铺 ═══
-  const store = t.match(/\b((?:HS|IB)[-\s]?(?:US|UK|DE|AU|CA|FR|IT|ES))\b/i);
-  if (store) out.store = store[1].toUpperCase().replace(/\s/, '-');
-
-  // ═══ 国家 ═══
-  const ctry = t.match(/\b(US|USA|United States|DE|Germany|UK|United Kingdom|GB|AU|Australia|CA|Canada|FR|France|IT|Italy|ES|Spain|JP|Japan)\b/i);
-  if (ctry) {
-    const map = { usa: 'US', 'united states': 'US', uk: 'UK', 'united kingdom': 'UK', gb: 'UK', de: 'DE', germany: 'DE', au: 'AU', australia: 'AU', ca: 'CA', canada: 'CA', fr: 'FR', france: 'FR', it: 'IT', italy: 'IT', es: 'ES', spain: 'ES', jp: 'JP', japan: 'JP' };
-    out.country = map[ctry[1].toLowerCase()] || ctry[1].toUpperCase();
-  }
-
-  // ═══ 返款方式（智能判断客户选了哪个选项）═══
-  // 优先检测客户明确选择的选项，而非仅匹配关键词
-  if (/(?:选了?| chose | go with | option\s*2|第二|选项二|order through amazon|order on amazon|provide you my order number|平台退款|refund.*amazon)/i.test(t)) {
-    out.refundMethod = '平台退款';
-  } else if (/(?:paypal|pp\s*account|paypal邮箱)/i.test(t) && !/(?:don't have|no paypal|without paypal|not use paypal|选项二|option\s*2|第二)/i.test(t)) {
-    out.refundMethod = 'PayPal';
-    // PayPal账号用客户邮箱（非自邮）
-    if (customerEmail) out.ppAccount = customerEmail;
-  } else if (/银行|bank\s*transfer/i.test(t)) {
-    out.refundMethod = '银行转账';
-  }
-
-  // ═══ 客户名 / 昵称（多种模式）═══
-  let customerName = '';
-  // 模式1: "From: XXX" 或 "收件人:" 中的名字
-  const fromM = t.match(/From:\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,30}?)(?:\n|$|<)/i);
-  if (fromM) customerName = fromM[1].trim();
-  // 模式2: 邮件签名 "Best regards,\nXXX" 或 "-XXX"
-  if (!customerName) {
-    const sigM = t.match(/(?:Best regards|Regards|Thanks|Cheers|Thank you)[\s\S]{0,3}\n\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|$)/i);
-    if (sigM) customerName = sigM[1].trim().replace(/^[-–—\s]+/, '');
-  }
-  // 模式3: "Hi XXX," 开头称呼
-  if (!customerName) {
-    const hiM = t.match(/^(?:Hi|Hello|Hey|Dear)\s+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)[,，]/im);
-    if (hiM) {
-      const n = hiM[1].trim();
-      // 排除操作员自己的名字
-      if (!/anna/i.test(n)) customerName = n;
+  // ════════════════════════════════════════
+  // §12  状态智能推断（从内容语义判断当前阶段）
+  // ════════════════════════════════════════
+  if (kind === 'order') {
+    // 已留评信号
+    // 已留评信号（允许 has [now/already] been 等变体）
+    if (/(?:review has(?:\s+\w+)?\s*been (?:posted|submitted|published|uploaded)|already posted (?:a |my )?review|left (?:a )?review|written (?:a )?review|review is (?:up|live|posted)|my review has (?:now )?been posted)/i.test(t)) {
+      out.status = 'completed';
+    }
+    // 正在测评/测试中
+    else if (/(?:testing|test the|currently testing|begin testing|enjoy testing|have received.*testing)/i.test(t)) {
+      out.status = 'reviewing';
+    }
+    // 已收货
+    else if (/(?:received (?:the )?(?:item|package|product|order)|it (?:should )?arrive|arrived|shipped|delivered)/i.test(t)) {
+      out.status = 'transferred';
+    }
+    // 已下单有订单号
+    else if (orderNumber) {
+      out.status = 'pending_refund';
+    }
+    else {
+      out.status = 'pending_refund';
+    }
+  } else {
+    // 红人状态推断
+    if (/(?:review has been|posted.*review|left.*review)/i.test(t)) {
+      out.status = 'reviewed';
+    } else if (/(?:testing|test the|received.*item)/i.test(t)) {
+      out.status = 'paid';
+    } else if (/(?:confirmed|would love to|interested|yes.*fine|okay.*for me)/i.test(t)) {
+      out.status = 'confirmed';
+    } else {
+      out.status = 'pending';
     }
   }
-  // 模式4: "My name is XXX"
-  if (!customerName) {
-    const nameM = t.match(/(?:My name is|I'm|This is)\s+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|\.|,|$)/i);
-    if (nameM) customerName = nameM[1].trim();
-  }
-  if (customerName) {
-    if (kind === 'lead') out.nickname = customerName;
-    else out.customerName = customerName;
-  } else if (kind === 'lead') {
-    // 红人兜底：从邮箱前缀取昵称
-    const at = customerEmail ? customerEmail.match(/@([\w.]{3,30})/) : null;
-    if (at) out.nickname = at[1];
-  }
 
-  // ═══ 产品名（多种模式）═══
-  let product = '';
-  // 模式1: 编号列表 "1. Product Name for XXX" 或 "1. XXX"
-  const listM = t.match(/(?:^|\n)\d+\.\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-/]{2,40}?)(?:\n|$|https?:|$)/i);
-  if (listM) product = listM[1].trim().replace(/\s*[（(].*[）)]\s*$/, '');  // 去掉括号注释
-  // 模式2: "产品|product" 关键词后跟名称
-  if (!product) {
-    const prodM = t.match(/(?:产品|product|买了|purchase|item|this product)[:：\s]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{2,30}?)(?:\n|$|\.|,|https?:)/i);
-    if (prodM) product = prodM[1].trim();
-  }
-  // 模式3: Amazon链接附近的文字 "XXX\nhttps://amzn.to/"
-  if (!product) {
-    const amznM = t.match(/([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{2,35}?)\s*\n\s*https?:\/\/amzn\.to\//i);
-    if (amznM) product = amznM[1].trim().replace(/^\d+\.\s*/, '');
-  }
-  if (product) out.product = product;
-
-  // ═══ 状态默认值 ═══
-  out.status = kind === 'lead' ? 'pending' : 'pending_refund';
-
-  // ═══ 关键信息摘要 ═══
+  // ════════════════════════════════════════
+  // §13  关键信息摘要
+  // ════════════════════════════════════════
   const found = [];
   if (out.orderNumber) found.push('订单号 ' + out.orderNumber);
   if (out.customerName || out.nickname) found.push('姓名 ' + (out.customerName || out.nickname));
   if (out.customerEmail || out.email) found.push('邮箱 ' + (out.customerEmail || out.email));
-  if (out.amount) found.push('金额 ' + out.currency + ' ' + out.amount);
+  if (out.amount) found.push('金额 ' + (out.currency || 'USD') + ' ' + out.amount);
   if (out.product) found.push('产品 ' + out.product);
   if (out.country) found.push('国家 ' + out.country);
   if (out.store) found.push('店铺 ' + out.store);
   if (out.platform) found.push('平台 ' + out.platform);
   if (out.refundMethod) found.push('返款方式 ' + out.refundMethod);
+  if (out.status) {
+    const statusLabel = kind === 'order' ? (STATUS[out.status] ? STATUS[out.status].label : out.status) : (OUTREACH_STATUS[out.status] ? OUTREACH_STATUS[out.status].label : out.status);
+    found.push('状态 ' + statusLabel);
+  }
   let summary = found.length ? ('已识别：' + found.join('；') + '。') : '未识别到明显字段。';
   summary += ' 其余字段请手动补充后保存。';
   return { fields: out, summary, source: 'local' };
@@ -5235,22 +5410,35 @@ async function callAIExtract(text, kind) {
   const fieldList = kind === 'order'
     ? ['orderNumber', 'customerName', 'customerEmail', 'store', 'product', 'amount', 'currency', 'country', 'socialMediaUrl', 'refundMethod', 'ppAccount', 'status', 'reviewContent']
     : ['platform', 'nickname', 'profileUrl', 'country', 'product', 'email', 'status'];
-  const selfEmails = (s._selfEmails || '').split(',').map(e => e.trim()).filter(Boolean).join(', ') || '(none)';
-  const sys = `You are a data extraction assistant for an aquarium influencer/order management system. The user pastes a chat/email with a customer or influencer. Extract structured fields and return ONLY valid JSON: {"fields":{...},"summary":"key points in Chinese"}.
-CRITICAL RULES:
-1. OPERATOR SELF-EMAILS (NEVER use these as customer email): ${selfEmails}. These belong to the operator (Anna from IBAY Aqua). The customer email is the OTHER person's email in the conversation.
-2. For "customerEmail"/"email": always pick the CUSTOMER's email, never the operator's. In email threads, look at "From:" and "To:" headers — the customer is the one who replied/ordered.
-3. For "refundMethod": detect which option the customer ACTUALLY chose. "I will order through Amazon" + "provide order number" = 平台退款(Amazon), NOT PayPal even if PayPal is mentioned as an unchosen option.
-4. For "product": look for product names near numbered lists, Amazon links, or phrases like "this product" / "test the XXX".
-5. For "customerName": check email signatures ("Best regards, XXX"), "From:" header, or "Hi XXX," salutation. Skip operator name (Anna).
-6. For "socialMediaUrl"/"profileUrl": skip e-commerce URLs (amazon, amzn, ebay, aliexpress, temu, shein). Only use actual social media profile links.
-7. E-commerce URLs (amzn.to, amazon.com/dp/, etc.) are PRODUCT links, NOT social media links. Put product info in "product" field instead.
+  const selfEmails = (s._selfEmails || 'anna@ibayaqua.com').split(',').map(e => e.trim()).filter(Boolean).join(', ') || '(none)';
+  const sys = `You are a data extraction assistant for an aquarium influencer/order management system. The user pastes a chat/email thread with a customer or influencer. Extract structured fields and return ONLY valid JSON: {"fields":{...},"summary":"key points in Chinese"}.
+
+CRITICAL RULES (follow strictly):
+1. OPERATOR SELF-EMAILS (NEVER use as customer email): ${selfEmails}. These belong to Anna at IBAY Aqua. Customer = the OTHER person.
+2. "customerEmail"/"email": Use "From:" header email (the person who wrote/replied). NEVER operator's own email.
+3. "orderNumber": Must be actual Amazon order # (digits+dashes like 111-8333069-5627461). NEVER extract English words like "number".
+4. "customerName": From "From:" name, or last email signature ("Best regards, XXX"). Skip Anna/IBAY.
+5. "product": From numbered list item, Amazon link context, or Subject line after "|". E.g., "3W Internal Aquarium Filter".
+6. "country": From email Subject line FIRST (e.g., "UK Product Testing Campaign" → UK). Then body text. Avoid false matches like "I'd" → IT.
+7. "store": Infer from country as "HS-{country}" if not explicitly mentioned.
+8. "refundMethod" — MULTI-SIGNAL DETECTION:
+   - PayPal signals: "I'd go with PayPal", "PayPal option", "PayPal would be convenient", "my PayPal", "received payment"+PayPal mentioned
+   - Platform refund signals: "option 2", "second option", "order through Amazon then provide order number"
+   - If customer explicitly chose PayPal → "PayPal". If chose option 2 / Amazon refund → "平台退款"
+   - "ppAccount" = customer's email address (NOT the word "PayPal")
+9. "status" — INFER FROM CONTENT:
+   - "review has been posted/left/written/uploaded" → completed
+   - "testing/test the/begin testing" → reviewing
+   - "received the item/package" → transferred
+   - Has order# but no receipt yet → pending_refund
+10. "socialMediaUrl"/"profileUrl": Skip ALL e-commerce URLs (amazon, amzn, ebay, aliexpress, temu, shein). Only real social profile links.
+
 Field names when present: ${fieldList.join(', ')}.
 - Missing fields => empty string "".
-- order "status": one of pending_refund, transferred, reviewing, completed, abandoned.
-- lead "status": one of pending, contacted, confirmed, guiding, paid, review_requested, review_retry, reviewed, abandoned.
-- "amount": number as string. "currency": USD/EUR/GBP/CNY.
-- "summary": 2-3 short Chinese sentences on what matters (e.g. 客户已收货等待索评 / 对退款方式有疑问 / 红人为TikTok新发现).`;
+- order "status": pending_refund | transferred | reviewing | completed | abandoned
+- lead "status": pending | contacted | confirmed | guiding | paid | review_requested | review_retry | reviewed | abandoned
+- "amount": number string. "currency": USD/EUR/GBP/CNY.
+- "summary": 2-3 short Chinese sentences on what matters.`;
   try {
     const resp = await fetch(`${endpoint}/chat/completions`, {
       method: 'POST',
