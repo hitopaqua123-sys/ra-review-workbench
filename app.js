@@ -13,6 +13,26 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':
 const fmtMoney = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
+
+/* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
+const APP_VERSION = '20260821e';
+
+/* ---------- force horizontal scroll on all tables ---------- */
+function forceTableScroll(root = document) {
+  const content = $('#content');
+  if (content) { content.style.overflowY = 'auto'; content.style.overflowX = 'hidden'; }
+  /* 关键修复：解除 .maxw 的宽度限制，让表格可以撑开并触发横向滚动 */
+  $$('.maxw', root).forEach((m) => { m.style.maxWidth = 'none'; });
+  $$('.table-wrap', root).forEach((wrap) => {
+    wrap.style.overflowX = 'auto';
+    wrap.style.overflowY = 'visible';
+    wrap.style.display = 'block';
+  });
+  $$('table.data', root).forEach((tbl) => {
+    tbl.style.width = 'max-content';
+    tbl.style.minWidth = '0';
+  });
+}
 function toast(msg, type = '') {
   const root = $('#toast-root');
   const t = document.createElement('div');
@@ -251,10 +271,10 @@ const DB_NAME = 'review_ops_workbench';
 let _db = null;
 function openDB() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open(DB_NAME, 3);
+    const r = indexedDB.open(DB_NAME, 4);
     r.onupgradeneeded = (e) => {
       const db = e.target.result;
-      ['customers', 'orders', 'settlements', 'comments', 'versions'].forEach((s) => {
+      ['customers', 'orders', 'settlements', 'comments', 'versions', 'leads'].forEach((s) => {
         if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
       });
     };
@@ -308,16 +328,241 @@ function getOne(store, id) {
   });
 }
 function putOne(store, item) {
-  return new Promise((res, rej) => {
+  if (item && typeof item === 'object' && !item.updatedAt) item.updatedAt = new Date().toISOString();
+  const local = new Promise((res, rej) => {
     tx(store, 'readwrite').then((os) => { const r = os.put(item); r.onsuccess = () => res(item); r.onerror = () => rej(r.error); }).catch(rej);
   });
+  local.then(() => {
+    if (isCloudActive() && !applyingRemote) cloudUpsert(store, item).catch((e) => console.warn('[cloud] upsert', e));
+  }).catch(() => {});
+  return local;
 }
 function delOne(store, id) {
-  return new Promise((res, rej) => {
+  const local = new Promise((res, rej) => {
     tx(store, 'readwrite').then((os) => { const r = os.delete(id); r.onsuccess = () => res(); r.onerror = () => rej(r.error); }).catch(rej);
   });
+  local.then(() => {
+    if (isCloudActive() && !applyingRemote) cloudDelete(store, String(id)).catch((e) => console.warn('[cloud] delete', e));
+  }).catch(() => {});
+  return local;
 }
 async function bulkPut(store, items) { for (const it of items) await putOne(store, it); }
+
+/* ============================================================
+   云端账号同步（Supabase）—— 包裹式，不影响现有本地逻辑
+   模式：local（仅本机） / cloud（账号云端同步，多设备实时）
+   ============================================================ */
+// ⚠️ 占位符：建好 Supabase 项目后，把下面两个值替换成真实值（由 Anna 提供）
+const SUPABASE_URL = 'https://cxlugyulwvtftkwkqafq.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_06BenVO6Yds551xL08m9Sg_fDH1I_4y';
+
+let _sbClient = null;
+function sbClient() {
+  if (_sbClient) return _sbClient;
+  if (typeof window.supabase === 'undefined' || !SUPABASE_URL.startsWith('http')) return null;
+  try { _sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY); }
+  catch (e) { console.warn('[cloud] Supabase 初始化失败', e); return null; }
+  return _sbClient;
+}
+function cloudConfigured() {
+  return SUPABASE_URL.startsWith('http') && SUPABASE_ANON_KEY.length > 20 && SUPABASE_ANON_KEY !== 'REPLACE_WITH_SUPABASE_ANON_KEY';
+}
+
+const SYNC_MODE_KEY = 'ra_sync_mode'; // 'local' | 'cloud'
+function getSyncMode() { return localStorage.getItem(SYNC_MODE_KEY) || 'local'; }
+function setSyncMode(m) { localStorage.setItem(SYNC_MODE_KEY, m); }
+
+let _sbUser = null;
+async function refreshSbUser() {
+  const s = sbClient();
+  if (!s) { _sbUser = null; return null; }
+  try { const { data } = await s.auth.getUser(); _sbUser = data && data.user ? data.user : null; }
+  catch (e) { _sbUser = null; }
+  return _sbUser;
+}
+function isCloudActive() {
+  return getSyncMode() === 'cloud' && cloudConfigured() && !!_sbUser;
+}
+
+// 防止实时回写造成云端环路
+let applyingRemote = false;
+function setApplyingRemote(v) { applyingRemote = v; }
+
+// 云端写入（upsert / delete）—— 云端表 records(user_id, store, rec_id, data, updated_at)
+async function cloudUpsert(store, item) {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  const rec = { user_id: _sbUser.id, store, rec_id: String(item.id), data: item, updated_at: new Date().toISOString() };
+  const { error } = await s.from('records').upsert(rec, { onConflict: 'user_id,store,rec_id' });
+  if (error) console.warn('[cloud] upsert 失败', store, item.id, error.message);
+}
+async function cloudDelete(store, id) {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  const { error } = await s.from('records').delete().eq('user_id', _sbUser.id).eq('store', store).eq('rec_id', String(id));
+  if (error) console.warn('[cloud] delete 失败', store, id, error.message);
+}
+
+// 登录 / 注册 / 登出
+async function cloudLogin(email, password) {
+  const s = sbClient(); if (!s) return { ok: false, msg: '云端未配置' };
+  const { data, error } = await s.auth.signInWithPassword({ email, password });
+  if (error) return { ok: false, msg: error.message };
+  _sbUser = data.user;
+  setSyncMode('cloud');
+  await cloudPullAll();
+  setupRealtime();
+  updateCloudUI();
+  return { ok: true };
+}
+async function cloudSignUp(email, password) {
+  const s = sbClient(); if (!s) return { ok: false, msg: '云端未配置' };
+  if (!password || password.length < 6) return { ok: false, msg: '密码至少 6 位' };
+  const { data, error } = await s.auth.signUp({ email, password });
+  if (error) return { ok: false, msg: error.message };
+  if (data.user && data.session) {
+    _sbUser = data.user;
+    setSyncMode('cloud');
+    await cloudPullAll();
+    setupRealtime();
+    updateCloudUI();
+    return { ok: true };
+  }
+  return { ok: false, msg: '注册成功，请查收邮箱完成验证后再登录' };
+}
+async function cloudLogout() {
+  const s = sbClient();
+  if (s) { try { await s.auth.signOut(); } catch (e) {} }
+  if (_sbChannel && s) { try { s.removeChannel(_sbChannel); } catch (e) {} _sbChannel = null; }
+  _sbUser = null;
+  setSyncMode('local');
+  updateCloudUI();
+}
+
+// 登录后把该账号全部云端记录拉到本地
+async function cloudPullAll() {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  const stores = ['customers', 'orders', 'comments', 'settlements', 'leads'];
+  try {
+    setApplyingRemote(true);
+    for (const store of stores) {
+      const { data, error } = await s.from('records').select('data').eq('user_id', _sbUser.id).eq('store', store);
+      if (error) { console.warn('[cloud] 拉取失败', store, error.message); continue; }
+      const items = (data || []).map((r) => r.data).filter(Boolean);
+      for (const it of items) await putOne(store, it);
+    }
+  } finally {
+    setApplyingRemote(false);
+  }
+  console.log('[cloud] 已拉取全部云端记录');
+}
+
+// 实时订阅：其他设备改动自动同步到本机
+let _sbChannel = null;
+function setupRealtime() {
+  const s = sbClient(); if (!s || !_sbUser) return;
+  if (_sbChannel) { try { s.removeChannel(_sbChannel); } catch (e) {} _sbChannel = null; }
+  _sbChannel = s.channel('ra-records-' + _sbUser.id)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'records', filter: 'user_id=eq.' + _sbUser.id }, (payload) => {
+      applyRemoteChange(payload);
+    })
+    .subscribe((status) => { console.log('[cloud] 实时订阅状态:', status); });
+}
+async function applyRemoteChange(payload) {
+  if (!isCloudActive()) return;
+  try {
+    setApplyingRemote(true);
+    if (payload.eventType === 'DELETE') {
+      const old = payload.old || {};
+      if (old.store && old.rec_id != null) await delOne(old.store, old.rec_id);
+    } else {
+      const neu = payload.new || {};
+      if (neu.store && neu.data) await putOne(neu.store, neu.data);
+    }
+  } finally {
+    setApplyingRemote(false);
+  }
+  if (typeof render === 'function') render();
+}
+
+// 顶栏 / 侧边栏云端状态
+function updateCloudUI() {
+  const btn = $('#btn-cloud');
+  const status = $('#cloud-status');
+  const env = $('.env-tag');
+  if (getSyncMode() === 'cloud' && _sbUser) {
+    if (btn) { btn.textContent = '☁️ 云端：' + (_sbUser.email || '已登录'); btn.classList.add('btn-primary'); }
+    if (status) status.textContent = '☁️ 云端已同步 · ' + (_sbUser.email || '');
+    if (env) env.textContent = '云端版 · 多设备实时同步';
+  } else if (getSyncMode() === 'cloud' && !_sbUser) {
+    if (btn) { btn.textContent = '☁️ 云端：点击登录'; btn.classList.remove('btn-primary'); }
+    if (status) status.textContent = '☁️ 云端：未登录';
+    if (env) env.textContent = '本地版 · 数据存于本机浏览器';
+  } else {
+    if (btn) { btn.textContent = '💾 本地模式'; btn.classList.remove('btn-primary'); }
+    if (status) status.textContent = '💾 本地模式（仅本机）';
+    if (env) env.textContent = '本地版 · 数据存于本机浏览器';
+  }
+}
+
+// 账号弹窗（登录 / 注册 / 登出）
+function openAuthModal() {
+  const m = openModal(`
+    <h3 style="margin:0 0 4px">☁️ 云端账号</h3>
+    <p class="tiny muted" style="margin:0 0 14px">登录后业务数据保存至云端，可在电脑/手机等多设备实时同步。</p>
+    <div class="field"><label>邮箱</label><input class="input" id="auth-email" type="email" placeholder="you@example.com" autocomplete="username"></div>
+    <div class="field"><label>密码</label><input class="input" id="auth-pwd" type="password" placeholder="至少 6 位" autocomplete="current-password"></div>
+    <div id="auth-err" style="color:#dc2626;font-size:13px;min-height:18px;margin:6px 0"></div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn btn-primary" id="auth-login" style="flex:1">登录</button>
+      <button class="btn" id="auth-signup" style="flex:1">注册</button>
+    </div>
+    ${_sbUser ? '<div style="margin-top:12px"><button class="btn btn-danger" id="auth-logout" style="width:100%">退出当前账号（切回本地模式）</button></div>' : ''}
+  `);
+  const email = m.root.querySelector('#auth-email');
+  const pwd = m.root.querySelector('#auth-pwd');
+  const err = m.root.querySelector('#auth-err');
+  const login = m.root.querySelector('#auth-login');
+  const signup = m.root.querySelector('#auth-signup');
+  const logout = m.root.querySelector('#auth-logout');
+  const doLogin = async () => {
+    err.textContent = '登录中…';
+    const r = await cloudLogin(email.value.trim(), pwd.value);
+    if (r.ok) { m.close(); toast('云端登录成功', 'success'); if (typeof render === 'function') render(); }
+    else err.textContent = r.msg;
+  };
+  const doSignup = async () => {
+    err.textContent = '注册中…';
+    const r = await cloudSignUp(email.value.trim(), pwd.value);
+    if (r.ok) { m.close(); toast('注册成功，已进入云端', 'success'); if (typeof render === 'function') render(); }
+    else err.textContent = r.msg;
+  };
+  if (login) login.addEventListener('click', doLogin);
+  if (signup) signup.addEventListener('click', doSignup);
+  if (logout) logout.addEventListener('click', async () => { await cloudLogout(); m.close(); if (typeof render === 'function') render(); });
+  if (pwd) pwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+  setTimeout(() => { if (email) email.focus(); }, 50);
+}
+
+// 启动云端（若先前处于云端模式且已登录，自动恢复会话）
+async function initCloudOnLoad() {
+  if (!cloudConfigured()) { updateCloudUI(); return; }
+  const s = sbClient(); if (!s) { updateCloudUI(); return; }
+  await refreshSbUser();
+  if (_sbUser && getSyncMode() === 'cloud') {
+    await cloudPullAll();
+    setupRealtime();
+  }
+  updateCloudUI();
+}
+
+// 顶栏按钮：本地↔云端切换 / 登录
+function bindCloudButton() {
+  const btn = $('#btn-cloud');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (!cloudConfigured()) { toast('尚未配置云端（缺少 Supabase 密钥）', 'warning'); return; }
+    openAuthModal();
+  });
+}
 /* ---------- modal / drawer ---------- */
 function openModal(html, { wide = false } = {}) {
   const root = $('#modal-root');
@@ -447,7 +692,13 @@ function imagesEditHtml(rec, field = 'reviewImages') {
 async function bindImagesEdit(root, rec, store, field = 'reviewImages', onChange) {
   const zone = $('.images-edit', root);
   if (!zone) return;
-  zone.addEventListener('click', (e) => { if (e.target.closest('.img-del')) return; zone.focus(); });
+  zone.addEventListener('click', (e) => {
+    // 点击缩略图（非删除按钮）放大预览
+    const thumbImg = e.target.closest('.img-thumb img');
+    if (thumbImg) { e.stopPropagation(); openImagePreview(thumbImg.src); return; }
+    if (e.target.closest('.img-del')) return;
+    zone.focus();
+  });
   zone.addEventListener('paste', async (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     const items = [...e.clipboardData.items].filter((it) => it.type.indexOf('image') !== -1);
@@ -488,6 +739,7 @@ const state = {
   pendingOrders: {},
   settlements: {},
   comments: { page: 1, pageSize: 15, kw: '', status: '', sourceTag: '', sel: [], displayCount: PAGE },
+  outreach: { kw: '', status: '' },
   charts: {},
 };
 
@@ -497,7 +749,7 @@ const state = {
 function navigate(view) {
   state.view = view;
   $$('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
-  const titles = { dashboard: '数据仪表盘', customers: '客户管理', orders: '订单管理', settlements: '结算管理', comments: '客户评论管理' };
+  const titles = { dashboard: '数据仪表盘', customers: '客户管理', orders: '订单管理', outreach: '红人跟进', settlements: '结算管理', comments: '客户评论管理' };
   $('#view-title').textContent = titles[view] || view;
   render();
 }
@@ -509,6 +761,7 @@ function render(keepScroll = false) {
   else if (state.view === 'orders') renderOrders(c, keepScroll);
   else if (state.view === 'settlements') renderSettlements(c);
   else if (state.view === 'comments') renderComments(c, keepScroll);
+  else if (state.view === 'outreach') renderOutreach(c, keepScroll);
 }
 function bindInfiniteScroll() {
   const c = $('#content');
@@ -540,6 +793,7 @@ const TABLE_SCHEMAS = {
     { key: 'source', label: '来源', sortable: true, filterable: true },
     { key: 'followers', label: '粉丝数', sortable: true, filterable: false },
     { key: 'cooperationCount', label: '合作次数', sortable: true, filterable: false },
+    { key: 'coopAttr', label: '合作属性', sortable: true, filterable: true },
     { key: 'product', label: '产品', sortable: true, filterable: true },
     { key: 'refundMethod', label: '返款方式', sortable: true, filterable: true },
     { key: 'ppAccount', label: 'PayPal', sortable: true, filterable: true },
@@ -569,11 +823,12 @@ const TABLE_SCHEMAS = {
     { key: 'status', label: '状态', sortable: true, filterable: true },
     { key: 'reviewImages', label: '评论截图', sortable: false, filterable: false },
     { key: 'commentSummary', label: '评论内容', sortable: false, filterable: false },
-    { key: 'reviewSubmitDate', label: '评论提交时间', sortable: true, filterable: false },
+    { key: 'reviewSubmitDate', label: '沟通反馈', sortable: true, filterable: false, defaultHidden: true },
     { key: 'country', label: '国家', sortable: true, filterable: true },
   ],
   comments: [
     { key: 'customerName', label: '客户', sortable: true, filterable: true },
+    { key: 'coopAttr', label: '合作属性', sortable: true, filterable: true },
     { key: 'productStore', label: '产品 / 店铺', sortable: true, filterable: false },
     { key: 'orderNumber', label: '订单号', sortable: true, filterable: true },
     { key: 'reviewContent', label: '评论内容', sortable: false, filterable: false },
@@ -581,13 +836,13 @@ const TABLE_SCHEMAS = {
     { key: 'images', label: '截图', sortable: false, filterable: false },
     { key: 'sourceTag', label: '来源', sortable: true, filterable: true },
     { key: 'reviewStatus', label: '状态', sortable: true, filterable: true },
-    { key: 'reviewSubmitDate', label: '提交时间', sortable: true, filterable: false },
+    { key: 'reviewSubmitDate', label: '提交时间', sortable: true, filterable: true },
   ],
 };
 function getTableState(key) {
   if (!state[key].cols) {
     const schema = TABLE_SCHEMAS[key];
-    state[key].cols = schema.map((c) => ({ key: c.key, label: c.label, hidden: false, sort: null, filter: '' }));
+    state[key].cols = schema.map((c) => ({ key: c.key, label: c.label, hidden: !!c.defaultHidden, sort: null, filter: '' }));
   }
   return state[key].cols;
 }
@@ -1128,6 +1383,185 @@ function openDropdownConfig(key, col, onChange) {
 /* ============================================================
    DASHBOARD
    ============================================================ */
+/* ============================================================
+   仪表盘折叠组件 + 红人阶段看板 (v20260821a)
+   ============================================================ */
+const DASH_COLLAPSE_KEY = 'dash_collapse_v1';
+function getDashCollapse() { try { return JSON.parse(localStorage.getItem(DASH_COLLAPSE_KEY)) || {}; } catch (e) { return {}; } }
+function setDashCollapse(o) { try { localStorage.setItem(DASH_COLLAPSE_KEY, JSON.stringify(o)); } catch (e) {} }
+function collapseSection(key, title, bodyHtml, rightHtml) {
+  const collapsed = !!getDashCollapse()[key];
+  return `<section class="collapse-card">
+    <header class="collapse-head" data-collapse-toggle="${esc(key)}">
+      <span class="collapse-arrow">${collapsed ? '▸' : '▾'}</span>
+      <span class="collapse-title">${title}</span>
+      <span class="collapse-right">${rightHtml || ''}</span>
+    </header>
+    <div class="collapse-body" data-collapse-body="${esc(key)}" ${collapsed ? 'hidden' : ''}>${bodyHtml}</div>
+  </section>`;
+}
+
+/* 高对比状态配色（看板/漏斗通用） */
+const OUTREACH_COLORS = {
+  pending: '#475569', contacted: '#0ea5e9', confirmed: '#8b5cf6', guiding: '#f59e0b',
+  paid: '#22c55e', review_requested: '#ec4899', review_retry: '#ef4444', reviewed: '#14b8a6', abandoned: '#94a3b8'
+};
+
+/* 红人阶段看板 HTML */
+async function renderOutreachKanban() {
+  const leads = await getAll('leads');
+  const statusKeys = Object.keys(OUTREACH_STATUS);
+  const counts = {};
+  statusKeys.forEach((k) => (counts[k] = 0));
+  leads.forEach((l) => { counts[l.status] = (counts[l.status] || 0) + 1; });
+  const activeKeys = statusKeys.filter((k) => OUTREACH_STATUS[k].nextAction != null);
+  const terminalKeys = statusKeys.filter((k) => OUTREACH_STATUS[k].nextAction == null);
+
+  // 活跃态转化漏斗
+  const funnel = `<div class="kanban-funnel">${activeKeys.map((k, idx) => {
+    const c = OUTREACH_STATUS[k];
+    return `${idx > 0 ? '<span class="funnel-arrow">→</span>' : ''}<div class="funnel-item">
+      <span class="funnel-dot" style="background:${OUTREACH_COLORS[k]}"></span>
+      <span class="funnel-label">${esc(c.label)}</span>
+      <span class="funnel-num" style="color:${OUTREACH_COLORS[k]}">${counts[k] || 0}</span>
+    </div>`;
+  }).join('')}</div>`;
+
+  // 终止态底部汇总 + 总数
+  const term = `<div class="kanban-term">${terminalKeys.map((k) => `<span class="term-chip" style="background:${OUTREACH_COLORS[k]}">${esc(OUTREACH_STATUS[k].label)} ${counts[k] || 0}</span>`).join('')}<span class="term-total">共 ${leads.length} 位红人</span></div>`;
+
+  // 9列看板
+  const cols = statusKeys.map((k) => {
+    const cfg = OUTREACH_STATUS[k];
+    const items = leads.filter((l) => l.status === k);
+    const body = items.length ? items.map((l) => kanbanCard(l, k)).join('') : '<div class="kanban-empty">暂无</div>';
+    return `<div class="kanban-col" style="border-top-color:${OUTREACH_COLORS[k]}">
+      <div class="kanban-col-head"><span class="kanban-col-name">${esc(cfg.label)}</span><span class="kanban-col-count" style="background:${OUTREACH_COLORS[k]}">${items.length}</span></div>
+      <div class="kanban-col-body">${body}</div>
+    </div>`;
+  }).join('');
+
+  return `<div class="kanban-wrap">${funnel}${term}<div class="kanban-board">${cols}</div></div>`;
+}
+
+/* 最近动态：跨红人收集 commLog 时间线 */
+function timeAgo(ts) {
+  if (!ts) return '';
+  const d = new Date(String(ts).includes('T') ? ts : ts + 'T00:00:00');
+  if (isNaN(d.getTime())) return String(ts);
+  const diff = (Date.now() - d.getTime()) / 1000;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff / 60) + '分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + '小时前';
+  const days = Math.floor(diff / 86400);
+  if (days === 1) return '昨天';
+  if (days < 30) return days + '天前';
+  return (d.getMonth() + 1) + '/' + d.getDate();
+}
+
+async function renderRecentActivity() {
+  const leads = await getAll('leads');
+  const items = [];
+  leads.forEach((l) => {
+    (l.commLog || []).forEach((e) => {
+      items.push({
+        ts: e.ts || e.date || l.lastActionDate || '',
+        action: e.action || '',
+        detail: e.detail || '',
+        nick: l.nickname || '—',
+        status: l.status,
+        id: l.id,
+      });
+    });
+  });
+  items.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+  if (!items.length) return '<div class="ra-empty">暂无动态，去「红人跟进」添加或推进红人吧</div>';
+  const startToday = new Date();
+  startToday.setHours(0, 0, 0, 0);
+  const startTodayMs = startToday.getTime();
+  const groups = [];
+  let cur = null, curKey = null;
+  items.forEach((it) => {
+    const d = new Date(String(it.ts).includes('T') ? it.ts : it.ts + 'T00:00:00');
+    let key;
+    if (isNaN(d.getTime())) {
+      key = '更早';
+    } else {
+      const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+      const diffDays = Math.floor((startTodayMs - dayStart) / 86400000);
+      key = diffDays <= 0 ? '今天' : diffDays === 1 ? '昨天' : (d.getMonth() + 1) + '/' + d.getDate();
+    }
+    if (!cur || cur.key !== key) { cur = { key, rows: [] }; groups.push(cur); }
+    cur.rows.push(it);
+  });
+  const rowHtml = (it) => {
+    const col = OUTREACH_COLORS[it.status] || '#94a3b8';
+    return `<div class="ra-row" data-k-act="open" data-id="${esc(it.id)}" title="点击查看 ${esc(it.nick)}">
+      <span class="ra-dot" style="background:${col}"></span>
+      <div class="ra-main">
+        <div class="ra-line1"><span class="ra-nick">${esc(it.nick)}</span><span class="ra-action">${esc(it.action)}</span></div>
+        ${it.detail ? `<div class="ra-detail">${esc(it.detail)}</div>` : ''}
+      </div>
+      <span class="ra-time">${timeAgo(it.ts)}</span>
+    </div>`;
+  };
+  return `<div class="ra-list">${groups.map((g) => `<div class="ra-group"><div class="ra-group-title">${esc(g.key)}</div>${g.rows.map(rowHtml).join('')}</div>`).join('')}</div>`;
+}
+
+async function renderMonthlyReport() {
+  const leads = await getAll('leads');
+  const now = new Date();
+  const thisYM = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+  const monthOf = (d) => {
+    if (!d) return '';
+    const dt = new Date(d);
+    if (isNaN(dt.getTime())) return '';
+    return dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0');
+  };
+  let newLeads = 0, advances = 0, reviewed = 0, abandoned = 0, active = 0;
+  const totalReviewed = leads.filter((l) => l.status === 'reviewed').length;
+  leads.forEach((l) => {
+    if (monthOf(l.createdAt) === thisYM) newLeads++;
+    if (['reviewed', 'abandoned'].includes(l.status)) {
+      if (l.status === 'reviewed' && monthOf(l.updatedAt) === thisYM) reviewed++;
+      else if (l.status === 'abandoned' && monthOf(l.updatedAt) === thisYM) abandoned++;
+    } else {
+      active++;
+    }
+    (l.commLog || []).forEach((e) => {
+      if (monthOf(e.ts || e.date) === thisYM && String(e.action || '').startsWith('状态:')) advances++;
+    });
+  });
+  const rate = newLeads ? Math.round((reviewed / newLeads) * 1000) / 10 : 0;
+  const monthLabel = now.getFullYear() + '年' + (now.getMonth() + 1) + '月';
+  const cell = (num, label, cls) => `<div class="rep-cell ${cls || ''}"><div class="rep-num">${typeof num === 'number' ? fmtInt(num) : esc(String(num))}</div><div class="rep-label">${label}</div></div>`;
+  return `<div class="rep-wrap">
+    <div class="rep-month">${monthLabel} · 红人跟进成果</div>
+    <div class="rep-grid">
+      ${cell(newLeads, '本月新增')}
+      ${cell(advances, '推进动作')}
+      ${cell(reviewed, '成功留评', 'rep-good')}
+      ${cell(abandoned, '放弃', 'rep-bad')}
+      ${cell(active, '活跃中')}
+      ${cell(rate + '%', '留评率', 'rep-hl')}
+    </div>
+    <div class="rep-foot">本月新增 ${newLeads} 位红人，其中 ${reviewed} 位成功留评（留评率 ${rate}%）；累计已留评 ${totalReviewed} 位，当前活跃跟进 ${active} 位。</div>
+  </div>`;
+}
+
+function kanbanCard(l, status) {
+  const trans = OUTREACH_TRANSITIONS[status] || [];
+  const advance = trans.length
+    ? `<button class="k-chip k-advance" data-k-act="advance" data-id="${esc(l.id)}" data-to="${esc(trans[0].to)}">${esc(trans[0].label)} →</button>`
+    : `<span class="k-done">已完成</span>`;
+  return `<div class="kanban-card" data-k-act="open" data-id="${esc(l.id)}">
+    <div class="k-nick">${esc(l.nickname || '—')}</div>
+    <div class="k-meta">${platformIcon(l.platform)} ${esc(l.country || '—')}</div>
+    ${l.product ? `<div class="k-product">${esc(l.product)}</div>` : ''}
+    <div class="k-actions">${advance}<button class="k-chip k-del" data-k-act="del" data-id="${esc(l.id)}" title="删除">✕</button></div>
+  </div>`;
+}
+
 async function renderDashboard(c) {
   const [customers, orders, settlements] = await Promise.all([getAll('customers'), getAll('orders'), getAll('settlements')]);
   const now = new Date();
@@ -1137,8 +1571,6 @@ async function renderDashboard(c) {
   const totalCustomers = customers.length;
   const totalOrders = orders.length;
   const monthlyNewCustomers = customers.filter((x) => ym(x.startDate) === thisMonth || ym(x.createdAt) === thisMonth).length;
-  const pendingCount = orders.filter((o) => o.status === 'pending_refund').length;
-  const settledAmount = orders.filter((o) => o.status !== 'pending_refund').reduce((s, o) => s + Number(o.amount || 0), 0);
 
   // country dist
   const cd = {};
@@ -1150,7 +1582,7 @@ async function renderDashboard(c) {
   orders.forEach((x) => { const k = x.store || '未知'; sd[k] = (sd[k] || 0) + 1; });
   const storeDist = Object.entries(sd).sort((a, b) => b[1] - a[1]);
 
-  // monthly trend (last 6 months)
+  // monthly trend (last 6 months) — 包含订单数、结算金额、新增客户数
   const months = [];
   for (let i = 5; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
@@ -1158,22 +1590,92 @@ async function renderDashboard(c) {
   }
   const trend = months.map((m) => {
     const os = orders.filter((o) => ym(o.orderDate) === m);
-    const settled = os.filter((o) => o.status !== 'pending_refund').reduce((s, o) => s + Number(o.amount || 0), 0);
-    return { month: m.slice(2), orderCount: os.length, settledAmount: settled };
+    const newCusts = customers.filter((x) => ym(x.startDate) === m || ym(x.createdAt) === m).length;
+    return { month: m.slice(2), orderCount: os.length, newCustomers: newCusts };
+  });
+
+  // 全部月份的新增客户+订单统计（用于明细表）
+  const allMonths = [...new Set([...customers.map((x) => ym(x.startDate) || ym(x.createdAt)), ...orders.map((o) => ym(o.orderDate))].filter(Boolean))].sort().reverse();
+  const monthlySummary = allMonths.slice(0, 12).map((m) => {
+    const oc = orders.filter((o) => ym(o.orderDate) === m);
+    const nc = customers.filter((x) => ym(x.startDate) === m || ym(x.createdAt) === m);
+    return { month: m, orderCount: oc.length, newCustomers: nc.length };
   });
 
   const recent = [...orders].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)).slice(0, 5);
 
-  c.innerHTML = `<div class="maxw">
+  const kanbanHtml = await renderOutreachKanban();
+  const activityHtml = await renderRecentActivity();
+  const reportHtml = await renderMonthlyReport();
+  const dashStyle = `<style>
+    .collapse-card { border:1px solid #eaeaea; border-radius:12px; margin-top:16px; background:#fff; overflow:hidden; }
+    .collapse-head { display:flex; align-items:center; gap:8px; padding:13px 16px; cursor:pointer; user-select:none; background:#fafafa; }
+    .collapse-head:hover { background:#f3f3f3; }
+    .collapse-arrow { font-size:12px; color:#888; }
+    .collapse-title { font-size:15px; font-weight:700; flex:1; }
+    .collapse-right { font-size:13px; }
+    .collapse-body { padding:16px; }
+    .collapse-body[hidden] { display:none; }
+    .kanban-funnel { display:flex; align-items:center; flex-wrap:wrap; gap:4px 0; margin-bottom:12px; padding:10px 12px; background:#f8f9fb; border-radius:10px; }
+    .funnel-item { display:inline-flex; align-items:center; gap:5px; padding:4px 10px; font-size:13px; font-weight:600; }
+    .funnel-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+    .funnel-num { font-size:15px; font-weight:800; }
+    .funnel-arrow { color:#cbd5e1; font-size:13px; padding:0 2px; }
+    .kanban-term { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+    .term-chip { color:#fff; font-size:12px; font-weight:600; padding:5px 12px; border-radius:20px; }
+    .term-total { margin-left:auto; font-size:13px; color:#64748b; font-weight:600; }
+    .kanban-board { display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; }
+    .kanban-col { flex:0 0 168px; background:#fbfbfc; border:1px solid #eef0f2; border-top:3px solid #ccc; border-radius:10px; padding:8px; min-height:120px; }
+    .kanban-col-head { display:flex; align-items:center; justify-content:space-between; font-size:13px; font-weight:700; margin-bottom:8px; }
+    .kanban-col-count { color:#fff; font-size:11px; font-weight:700; min-width:20px; height:20px; border-radius:10px; display:inline-flex; align-items:center; justify-content:center; padding:0 6px; }
+    .kanban-col-body { display:flex; flex-direction:column; gap:8px; }
+    .kanban-card { background:#fff; border:1px solid #e9e9ec; border-radius:9px; padding:9px; cursor:pointer; transition:box-shadow .12s, transform .12s; }
+    .kanban-card:hover { box-shadow:0 2px 10px rgba(0,0,0,.08); transform:translateY(-1px); }
+    .k-nick { font-size:13px; font-weight:700; margin-bottom:3px; }
+    .k-meta { font-size:11px; color:#888; margin-bottom:4px; }
+    .k-product { font-size:11px; color:#555; background:#f3f4f6; border-radius:5px; padding:2px 6px; margin-bottom:6px; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .k-actions { display:flex; gap:5px; align-items:center; }
+    .k-chip { font-size:11px; padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer; white-space:nowrap; }
+    .k-advance { color:#fff; border:none; background:#111; font-weight:600; }
+    .k-advance:hover { background:#333; }
+    .k-del { color:#dc2626; border-color:#dc2626; }
+    .k-del:hover { background:#fef2f2; }
+    .k-done { font-size:11px; color:#16a34a; font-weight:600; }
+    .kanban-empty { font-size:12px; color:#bbb; text-align:center; padding:14px 0; }
+    .ra-list { display:flex; flex-direction:column; gap:2px; }
+    .ra-row { display:flex; align-items:flex-start; gap:10px; padding:9px 8px; border-radius:8px; cursor:pointer; transition:background .12s; }
+    .ra-row:hover { background:#f6f7f9; }
+    .ra-dot { width:9px; height:9px; border-radius:50%; margin-top:5px; flex:0 0 auto; }
+    .ra-main { flex:1; min-width:0; }
+    .ra-line1 { font-size:13px; display:flex; gap:6px; align-items:baseline; flex-wrap:wrap; }
+    .ra-nick { font-weight:700; color:#1f2937; }
+    .ra-action { color:#475569; font-size:12px; }
+    .ra-detail { font-size:12px; color:#94a3b8; margin-top:2px; }
+    .ra-time { font-size:11px; color:#cbd5e1; white-space:nowrap; flex:0 0 auto; margin-top:2px; }
+    .ra-empty { font-size:13px; color:#bbb; text-align:center; padding:20px 0; }
+    .ra-group { margin-bottom:10px; }
+    .ra-group-title { font-size:12px; font-weight:700; color:#94a3b8; margin:6px 0 4px; padding-left:2px; }
+    .rep-wrap { }
+    .rep-month { font-size:13px; font-weight:700; color:#475569; margin-bottom:10px; }
+    .rep-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; }
+    .rep-cell { background:#f8f9fb; border:1px solid #eef0f2; border-radius:10px; padding:14px 8px; text-align:center; }
+    .rep-num { font-size:22px; font-weight:800; color:#1f2937; line-height:1.1; }
+    .rep-label { font-size:12px; color:#64748b; margin-top:5px; }
+    .rep-good .rep-num { color:#22c55e; }
+    .rep-bad .rep-num { color:#ef4444; }
+    .rep-hl .rep-num { color:#0ea5e9; }
+    .rep-foot { font-size:12.5px; color:#64748b; margin-top:12px; line-height:1.6; }
+  </style>`;
+
+  c.innerHTML = `${dashStyle}<div class="maxw">
     <div class="dash-title">核心指标概览与业务趋势分析</div>
     <div class="stat-grid">
       <div class="stat" data-stat="customers" style="cursor:pointer" title="点击查看客户明细"><div class="stat-head"><span class="label">总客户数</span><span class="stat-ico">☺</span></div><div class="value">${fmtInt(totalCustomers)}</div><div class="sub">Customers</div></div>
       <div class="stat" data-stat="orders" style="cursor:pointer" title="点击查看订单明细"><div class="stat-head"><span class="label">总订单数</span><span class="stat-ico">▤</span></div><div class="value">${fmtInt(totalOrders)}</div><div class="sub">Review Orders</div></div>
       <div class="stat" data-stat="monthlyNew" style="cursor:pointer" title="点击查看本月新增客户"><div class="stat-head"><span class="label">本月新增客户</span><span class="stat-ico">✚</span></div><div class="value">${fmtInt(monthlyNewCustomers)}</div><div class="sub">This Month</div></div>
-      <div class="stat" data-stat="pending" style="cursor:pointer" title="点击查看待结算订单"><div class="stat-head"><span class="label">待结算订单</span><span class="stat-ico">⧗</span></div><div class="value">${fmtInt(pendingCount)}</div><div class="sub">Pending Refund</div></div>
-      <div class="stat" data-stat="settled" style="cursor:pointer" title="点击查看已结算明细"><div class="stat-head"><span class="label">已结算金额</span><span class="stat-ico">$</span></div><div class="value">${fmtAmount(settledAmount, 'USD')}</div><div class="sub">Settled Amount (USD 等值)</div></div>
+      <div class="stat" data-stat="monthlyTable" style="cursor:pointer" title="查看月度统计明细"><div class="stat-head"><span class="label">近12月新增客户</span><span class="stat-ico">📈</span></div><div class="value">${fmtInt(monthlySummary.reduce((s, m) => s + m.newCustomers, 0))}</div><div class="sub">累计 (人)</div></div>
     </div>
-    <div class="chart-grid">
+    ${collapseSection('dist', '📊 分布概览 · 国家 & 店铺', `<div class="chart-grid">
       <div class="chart-box">
         <h4>国家客户分布</h4>
         <div class="chart-toolbar"><button class="btn btn-sm" id="cty-reset">⟲ 重置视图</button><button class="btn btn-sm" id="cty-all">显示全部</button></div>
@@ -1184,10 +1686,10 @@ async function renderDashboard(c) {
         <div class="chart-toolbar"><button class="btn btn-sm" id="store-reset">⟲ 重置视图</button></div>
         <div class="chart-canvas-wrap"><canvas id="storeChart"></canvas></div>
       </div>
-    </div>
-    <div class="chart-grid" style="grid-template-columns:1fr">
+    </div>`)}\n
+    ${collapseSection('trend', '📈 月度订单与新增客户趋势', `<div class="chart-grid" style="grid-template-columns:1fr">
       <div class="chart-box">
-        <h4>月度订单与结算趋势</h4>
+        <h4>月度订单与新增客户趋势</h4>
         <div class="chart-toolbar">
           <button class="btn btn-sm ${state.charts.trendRange === 1 ? 'active' : ''}" data-tr="1">近1个月</button>
           <button class="btn btn-sm ${state.charts.trendRange === 3 ? 'active' : ''}" data-tr="3">近3个月</button>
@@ -1198,12 +1700,26 @@ async function renderDashboard(c) {
         </div>
         <div class="chart-canvas-wrap"><canvas id="trendChart"></canvas></div>
       </div>
-    </div>
-    <div class="card mt"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">最近订单</h4>
+    </div>`)}
+
+    ${collapseSection('monthly', '📋 月度统计明细（近12个月）', `<div class="card mt" style="margin-top:0"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">📊 月度统计明细（近12个月）</h4>
+      <div class="table-wrap"><table class="data"><thead><tr><th>月份</th><th class="num">新增客户</th><th class="num">订单数</th></tr></thead><tbody>
+        ${monthlySummary.map((m) => `<tr><td>${esc(m.month)}</td><td class="num">${fmtInt(m.newCustomers)}</td><td class="num">${fmtInt(m.orderCount)}</td></tr>`).join('')}
+      </tbody></table></div>
+    </div>`)}
+
+    ${collapseSection('kanban', '🎯 红人阶段看板', kanbanHtml, '<button class="btn btn-sm" data-go="outreach">跳转红人跟进 →</button>')}
+
+    ${collapseSection('report', '📅 本月跟进报告', reportHtml, '<button class="btn btn-sm" data-go="outreach">查看全部 →</button>')}
+
+    ${collapseSection('activity', '🔔 最近动态', activityHtml, '<button class="btn btn-sm" data-go="outreach">查看全部 →</button>')}
+
+    ${collapseSection('recent', '🧾 最近订单', `<div class="card mt" style="margin-top:0"><h4 style="font-size:13px;font-weight:600;margin-bottom:10px">最近订单</h4>
       ${recent.length ? `<div class="table-wrap"><table class="data"><thead><tr><th>订单号</th><th>客户</th><th>店铺</th><th>产品</th><th class="num">金额</th><th>状态</th><th>日期</th></tr></thead><tbody>
         ${recent.map((o) => `<tr style="cursor:pointer" data-order="${o.id}"><td class="mono">${esc(o.orderNumber)}</td><td>${esc(o.customerName)}</td><td>${esc(o.store)}</td><td class="cell-ellipsis">${esc(o.product)}</td><td class="num">${fmtAmount(o.amount, o.currency || o.country)}</td><td>${statusBadge(o.status)}</td><td>${fmtDate(o.orderDate)}</td></tr>`).join('')}
       </tbody></table></div>` : '<div class="empty">暂无订单数据</div>'}
-    </div>
+    </div>`)}
+
   </div>`;
 
   $$('tr[data-order]', c).forEach((tr) => tr.addEventListener('click', (e) => { e.stopPropagation(); openOrderDetail(tr.dataset.order); }));
@@ -1227,6 +1743,42 @@ async function renderDashboard(c) {
   }));
   const trendReset = $('#trend-reset');
   if (trendReset) trendReset.addEventListener('click', () => { state.charts.trendRange = null; renderDashboard(c); });
+
+  // 折叠卡片 toggle
+  $$('[data-collapse-toggle]', c).forEach((h) => h.addEventListener('click', () => {
+    const key = h.dataset.collapseToggle;
+    const body = $(`[data-collapse-body="${key}"]`, c);
+    const arrow = $('.collapse-arrow', h);
+    const cur = getDashCollapse();
+    const nowCollapsed = !cur[key];
+    cur[key] = nowCollapsed;
+    setDashCollapse(cur);
+    if (body) body.hidden = nowCollapsed;
+    if (arrow) arrow.textContent = nowCollapsed ? '▸' : '▾';
+    if (!nowCollapsed) {
+      setTimeout(() => { Object.values(state.charts).forEach((ch) => { try { ch.resize(); } catch (e) {} }); }, 40);
+    }
+  }));
+
+  // 看板：跳转红人跟进
+  $$('[data-go="outreach"]', c).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); navigate('outreach'); }));
+
+  // 看板卡片操作（委托：点按钮取最近 data-k-act，避免冒泡到卡片 open）
+  c.addEventListener('click', async (e) => {
+    const t = e.target.closest('[data-k-act]');
+    if (!t) return;
+    const act = t.dataset.kAct;
+    const id = t.dataset.id;
+    if (act === 'open') {
+      const lead = (await getAll('leads')).find((x) => x.id === id);
+      if (lead) openLeadForm(lead);
+    } else if (act === 'advance') {
+      await transitionLead(id, t.dataset.to);
+    } else if (act === 'del') {
+      e.stopPropagation();
+      deleteLead(id);
+    }
+  });
 }
 async function openStatDetail(type) {
   const customers = await getAll('customers');
@@ -1253,16 +1805,16 @@ async function openStatDetail(type) {
     title = `本月新增客户明细 (${list.length})`;
     headers = ['姓名', '国家', '来源', '开始日期'];
     rows = list.map((x) => [esc(x.name), esc(x.country), esc(x.source), fmtDate(x.startDate)]);
-  } else if (type === 'pending') {
-    const list = orders.filter((o) => o.status === 'pending_refund');
-    title = `待结算订单明细 (${list.length})`;
-    headers = ['订单号', '客户', '店铺', '金额', '日期'];
-    rows = list.map((o) => [esc(o.orderNumber), esc(o.customerName), esc(o.store), fmtAmount(o.amount, o.currency || o.country), fmtDate(o.orderDate)]);
-  } else if (type === 'settled') {
-    const list = orders.filter((o) => o.status !== 'pending_refund');
-    title = `已结算金额明细 (${list.length})`;
-    headers = ['订单号', '客户', '店铺', '金额', '状态'];
-    rows = list.map((o) => [esc(o.orderNumber), esc(o.customerName), esc(o.store), fmtAmount(o.amount, o.currency || o.country), statusBadge(o.status)]);
+  } else if (type === 'monthlyTable') {
+    const list = customers.slice();
+    title = `近12个月新增客户趋势`;
+    headers = ['月份', '新增客户', '订单数'];
+    const ms = {};
+    list.forEach((x) => { const k = ym(x.startDate) || ym(x.createdAt); if (k) ms[k] = (ms[k] || 0) + 1; });
+    const om = {};
+    orders.forEach((o) => { const k = ym(o.orderDate); if (k) om[k] = (om[k] || 0) + 1; });
+    const keys = Object.keys({ ...ms, ...om }).sort().reverse().slice(0, 12);
+    rows = keys.map((k) => [k, fmtInt(ms[k] || 0), fmtInt(om[k] || 0)]);
   }
   const html = `<div class="table-wrap"><table class="data"><thead><tr>${headers.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>
     ${rows.map((cells) => `<tr>${cells.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}
@@ -1279,14 +1831,14 @@ function drawTrend(id, trend) {
     type: 'bar',
     data: { labels: data.map((t) => t.month), datasets: [
       { type: 'bar', label: '订单数量', data: data.map((t) => t.orderCount), yAxisID: 'y', backgroundColor: '#FFD600', borderRadius: 6, barPercentage: 0.45, order: 2 },
-      { type: 'line', label: '结算金额($)', data: data.map((t) => t.settledAmount), yAxisID: 'y1', borderColor: '#111111', backgroundColor: '#111111', pointRadius: 5, pointBackgroundColor: '#FFD600', pointBorderColor: '#111111', pointBorderWidth: 2, tension: .35, borderWidth: 2.5, order: 1 },
+      { type: 'line', label: '新增客户', data: data.map((t) => t.newCustomers || 0), yAxisID: 'y1', borderColor: '#111111', backgroundColor: '#111111', pointRadius: 5, pointBackgroundColor: '#FFD600', pointBorderColor: '#111111', pointBorderWidth: 2, tension: .35, borderWidth: 2.5, order: 1 },
     ]},
     options: {
       responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
       plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } }, tooltip: { callbacks: { label: (c) => `${c.dataset.label}：${c.raw}` } } },
       scales: {
         y: { position: 'left', beginAtZero: true, title: { display: true, text: '订单数量', color: '#666', font: { weight: '700' } }, grid: { color: 'rgba(0,0,0,.05)' }, ticks: { color: '#666' } },
-        y1: { position: 'right', beginAtZero: true, title: { display: true, text: '结算金额($)', color: '#666', font: { weight: '700' } }, grid: { drawOnChartArea: false }, ticks: { color: '#666' } },
+        y1: { position: 'right', beginAtZero: true, title: { display: true, text: '新增客户', color: '#666', font: { weight: '700' } }, grid: { drawOnChartArea: false }, ticks: { color: '#666' } },
         x: { grid: { display: false }, ticks: { color: '#666', maxRotation: 30, minRotation: 0 } }
       }
     },
@@ -1398,6 +1950,12 @@ async function renderCustomers(c, keepScroll = false) {
           if (_dd) { v = _dd; }
           else if (c.key === 'name') v = `<td><span class="customer-name-link" data-cid="${x.id}">${esc(x.name)}</span></td>`;
           else if (c.key === 'followers' || c.key === 'cooperationCount') v = `<td class="num">${fmtInt(x[c.key])}</td>`;
+          else if (c.key === 'coopAttr') {
+            const cnt = Number(x.cooperationCount || x.cooperationIndex || 0);
+            const attr = cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作');
+            const cls = cnt <= 0 ? 'neutral' : (cnt === 1 ? 'success' : 'warning');
+            v = `<td><span class="badge badge-${cls}">${attr}</span></td>`;
+          }
           else if (c.key === 'startDate') v = `<td>${fmtDate(x.startDate)}</td>`;
           else if (c.key === '__formula__') v = `<td class="num">${esc(applyFormula(c.formulaExpr, x))}</td>`;
           else v = `<td ${c.key === 'product' || c.key === 'ppAccount' ? 'class="cell-ellipsis"' : ''}>${esc(x[c.key])}</td>`;
@@ -1455,6 +2013,7 @@ async function renderCustomers(c, keepScroll = false) {
   const clearAll = $('[data-clear-all]', c);
   if (clearAll) clearAll.addEventListener('click', () => { clearAllTableFilters(clearAll.dataset.tableKey); renderCustomers(c); });
   if (!keepScroll) c.scrollTop = 0;
+  forceTableScroll(c);
   restoreFocus(_focusSnap);
 }
 
@@ -1952,6 +2511,7 @@ async function renderOrders(c, keepScroll = false) {
       <button class="btn btn-sm" id="o-excel-in">⭱ 导入Excel</button>
       <button class="btn btn-sm btn-danger" id="o-batch">🗑 批量删除 (<span id="o-batch-n">0</span>)</button>
       <button class="btn btn-sm" id="o-cols" title="列设置（显示/隐藏/下拉配置）">⚙ 列设置</button>
+      <button class="btn btn-sm" id="o-ai">🤖 AI录入</button>
       <button class="btn btn-primary btn-sm" id="o-add">+ 新增订单</button>
     </div>
     ${filterTagsHtml('orders')}
@@ -1971,7 +2531,7 @@ async function renderOrders(c, keepScroll = false) {
           else if (c.key === 'orderNumber') v = `<td class="mono">${esc(x.orderNumber)}</td>`;
           else if (c.key === 'status') v = `<td>${statusBadge(x.status)}</td>`;
           else if (c.key === 'reviewImages') { const imgs = x.reviewImages || []; v = imgs.length ? `<td><div class="thumb-row">${imgs.slice(0, 3).map((u) => `<img class="cell-thumb" src="${esc(u)}" title="点击放大">`).join('')}${imgs.length > 3 ? ` <span class="tiny">+${imgs.length - 3}</span>` : ''}</div></td>` : `<td>—</td>`; }
-          else if (c.key === 'reviewSubmitDate') v = `<td>${x.reviewSubmitDate ? fmtDate(x.reviewSubmitDate) : '—'}</td>`;
+          else if (c.key === 'reviewSubmitDate') v = `<td class="cell-ellipsis">${esc(x.feedback || '—')}${x.reviewSubmitDate ? `<div class="tiny muted">${fmtDate(x.reviewSubmitDate)}</div>` : ''}</td>`;
           else if (c.key === 'commentSummary') {
             const cms = x.comments || [];
             if (!cms.length) v = `<td>—</td>`;
@@ -2018,6 +2578,7 @@ async function renderOrders(c, keepScroll = false) {
   const sortTh = $('#o-sort-th');
   if (sortTh) sortTh.addEventListener('click', toggleSort);
   $('#o-add').addEventListener('click', () => openOrderForm(null));
+  const oAi = $('#o-ai'); if (oAi) oAi.addEventListener('click', () => openAIExtractModal('order'));
   $('#o-cols').addEventListener('click', () => openColumnSettings('orders', () => renderOrders(c, true)));
   $('#o-comment-stat').addEventListener('click', () => openCommentMonthChart(list));
   $$('.comment-expand', c).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); const id = b.dataset.cid; if (state.orders._expanded.has(id)) state.orders._expanded.delete(id); else state.orders._expanded.add(id); renderOrders(c, true); }));
@@ -2052,6 +2613,7 @@ async function renderOrders(c, keepScroll = false) {
   const clearAll = $('[data-clear-all]', c);
   if (clearAll) clearAll.addEventListener('click', () => { clearAllTableFilters(clearAll.dataset.tableKey); renderOrders(c); });
   if (!keepScroll) c.scrollTop = 0;
+  forceTableScroll(c);
   restoreFocus(_focusSnap);
 }
 function renderEmptyOrders(c) {
@@ -2131,7 +2693,8 @@ async function openOrderForm(id, prefill = null) {
       if (dbOrder) v = dbOrder;
     }
   } else if (prefill) {
-    v = prefill.orderNumber != null ? buildOrderPrefillFromOrder(prefill) : buildOrderPrefillFromCustomer(prefill);
+    if (prefill.__raw) v = prefill;
+    else v = prefill.orderNumber != null ? buildOrderPrefillFromOrder(prefill) : buildOrderPrefillFromCustomer(prefill);
   }
   const allOrders = await getAll('orders');
   const storeOptions = [...new Set([...allOrders.map((x) => x.store), 'HS-US', 'HS-UK', 'HS-DE', 'HS-AU', 'HS-CA', 'HS-FR', 'IB-US', 'IB-UK', 'IB-DE', 'IB-AU', 'IB-CA', 'IB-FR'].filter(Boolean))].sort();
@@ -2201,6 +2764,8 @@ async function openOrderForm(id, prefill = null) {
       if (originalOrder && originalOrder.customerId && originalOrder.customerId !== rec.customerId) {
         await recomputeCustomerStatsById(originalOrder.customerId);
       }
+      // 跨模块联动：订单评论字段 -> 客户评论管理（按订单号同步/新建）
+      await syncOrderReviewToComments(rec);
       renderCustomersIfVisible(true);
       m.close(); toast(isEdit ? '已更新' : '已新增', 'success'); render();
     } catch (err) {
@@ -2278,7 +2843,7 @@ async function openOrderDetail(id) {
     tabs: [{ label: '详情', html: body }, { label: '评论管理', html: cmPaneHtml }],
     onReady: (panel, close) => {
       bindImagesEdit(panel, o, 'orders', 'reviewImages', () => { close(); openOrderDetail(id); });
-      bindInlineEdit(panel, o, 'orders', defs, { onSave: async (rec) => { await recomputeCustomerStatsForOrder(rec); renderCustomersIfVisible(true); } });
+      bindInlineEdit(panel, o, 'orders', defs, { onSave: async (rec) => { await recomputeCustomerStatsForOrder(rec); await syncOrderReviewToComments(rec); renderCustomersIfVisible(true); } });
       if (linkedCustomer) {
         $('#d-view-cust', panel).addEventListener('click', () => openCustomerFloat(linkedCustomer.id));
         $('#d-new-order', panel).addEventListener('click', () => openOrderForm(null, linkedCustomer));
@@ -2299,19 +2864,39 @@ async function deleteOrder(id) {
   const allComments = await getAll('comments');
   const linkedComments = allComments.filter((c) => c.orderId === id || (c.orderNumber && o && c.orderNumber === o.orderNumber));
   let msg = '确定删除该订单？此操作不可撤销。';
-  if (linkedComments.length > 0) msg += `\n\n⚠️ 该订单关联 ${linkedComments.length} 条评论记录，删除后评论仍保留但失去订单关联。`;
+  if (linkedComments.length > 0) msg += `\n\n⚠️ 该订单关联 ${linkedComments.length} 条评论记录，将同步标记为「订单已删除」。`;
   if (!confirm(msg)) return;
+  // 同步更新关联评论：清除 orderId、标记来源为已删除订单
+  for (const c of linkedComments) {
+    c.orderId = null;
+    c._orderDeleted = true;
+    c._deletedOrderNumber = o ? o.orderNumber : '';
+    c.updatedAt = new Date().toISOString();
+    await putOne('comments', c);
+  }
   await delOne('orders', id);
   if (o) await recomputeCustomerStatsForOrder(o);
   renderCustomersIfVisible(true);
-  toast('已删除', 'success'); render();
+  toast(linkedComments.length ? `已删除订单，${linkedComments.length} 条评论已同步更新` : '已删除', 'success'); render();
 }
 async function batchDeleteOrders() {
   const ids = [...state.orders.sel];
   if (!ids.length) { toast('请先勾选要删除的订单', 'info'); return; }
-  if (!confirm(`确定删除选中的 ${ids.length} 个订单？此操作不可撤销。\n（批量删除不会自动删除相关客户的其它订单）`)) return;
   const orders = await getAll('orders');
   const toDelete = orders.filter((o) => ids.includes(o.id));
+  // 先同步更新关联评论
+  const allComments = await getAll('comments');
+  let syncedCount = 0;
+  for (const o of toDelete) {
+    const linked = allComments.filter((c) => c.orderId === o.id || (c.orderNumber && o.orderNumber && c.orderNumber === o.orderNumber));
+    for (const c of linked) {
+      c.orderId = null; c._orderDeleted = true; c._deletedOrderNumber = o.orderNumber || '';
+      c.updatedAt = new Date().toISOString();
+      await putOne('comments', c);
+      syncedCount++;
+    }
+  }
+  if (!confirm(`确定删除选中的 ${ids.length} 个订单？此操作不可撤销。\n${syncedCount > 0 ? `将同步标记 ${syncedCount} 条关联评论为「订单已删除」。\n` : ''}（批量删除不会自动删除相关客户的其它订单）`)) return;
   const affectedCustomerIds = new Set();
   for (const o of toDelete) {
     await delOne('orders', o.id);
@@ -2320,7 +2905,7 @@ async function batchDeleteOrders() {
   for (const cid of affectedCustomerIds) await recomputeCustomerStatsById(cid);
   renderCustomersIfVisible(true);
   state.orders.sel = [];
-  toast(`已删除 ${ids.length} 个订单`, 'success'); render();
+  toast(`已删除 ${ids.length} 个订单${syncedCount > 0 ? `，${syncedCount} 条评论已同步` : ''}`, 'success'); render();
 }
 
 /* ============================================================
@@ -2408,6 +2993,7 @@ async function renderSettlements(c) {
   bindDropdownCells(c, () => renderSettlements(c));
   $$('[data-col][data-table-key]', c).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); clearColFilter(b.dataset.tableKey, b.dataset.col); renderSettlements(c); }));
   $$('[data-clear-all]', c).forEach((b) => b.addEventListener('click', () => { clearAllTableFilters(b.dataset.tableKey); renderSettlements(c); }));
+  forceTableScroll(c);
 }
 
 /* ============================================================
@@ -2416,8 +3002,8 @@ async function renderSettlements(c) {
 const REVIEW_STATUS = {
   pending_invite: { label: '待邀约', cls: 'warning' },
   published: { label: '已发布', cls: 'primary' },
-  review_lost: { label: '评价丢失', cls: 'danger' },
-  declined: { label: '拒绝评价', cls: 'muted' },
+  pending_supplement: { label: '待补差价', cls: 'warning' },
+  follow_up_review: { label: '追加评价', cls: 'info' },
   reviewed: { label: '已评价', cls: 'success' },
 };
 
@@ -2428,6 +3014,9 @@ async function fetchComments() {
   if (f.kw) list = list.filter((x) => matchKw(f.kw, [x.customerName, x.customerEmail, x.product, x.orderNumber]));
   if (f.status) list = list.filter((x) => x.reviewStatus === f.status);
   if (f.sourceTag) list = list.filter((x) => (x.sourceTag || '').toLowerCase().includes(f.sourceTag.toLowerCase()));
+  // 提交时间日期范围筛选
+  if (f.dateFrom) list = list.filter((x) => x.reviewSubmitDate && x.reviewSubmitDate >= f.dateFrom);
+  if (f.dateTo) list = list.filter((x) => x.reviewSubmitDate && x.reviewSubmitDate <= f.dateTo + 'T23:59:59');
   list = applyColFilter('comments', list);
   list = applyColSort('comments', list);
   return list;
@@ -2437,6 +3026,19 @@ async function renderComments(c, keepScroll = false) {
   const allComments = await getAll('comments');
   const allCustomers = await getAll('customers');
   const allOrders = await getAll('orders');
+
+  // 建立客户快速索引（按名称/邮箱，忽略大小写与空格），用于按「客户管理合作次数」反查合作属性
+  const custByName = {}; const custByEmail = {};
+  allCustomers.forEach((cc) => {
+    if (cc.name) custByName[String(cc.name).trim().toLowerCase()] = cc;
+    if (cc.email) custByEmail[String(cc.email).trim().toLowerCase()] = cc;
+  });
+  function findCustForComment(x) {
+    const byName = custByName[String(x.customerName || '').trim().toLowerCase()];
+    if (byName) return byName;
+    if (x.customerEmail) { const byMail = custByEmail[String(x.customerEmail || '').trim().toLowerCase()]; if (byMail) return byMail; }
+    return {};
+  }
 
   // 如果 comments store 为空但有订单评论数据，做一次迁移
   if (!allComments.length) {
@@ -2470,13 +3072,18 @@ async function renderComments(c, keepScroll = false) {
       <div class="toolbar">
         <input class="input" style="max-width:260px" id="cm-kw" placeholder="搜索客户、邮箱、产品、订单号…" value="${esc(state.comments.kw)}">
         ${comboFilterHtml({ id: 'cm-status', allLabel: '全部状态', value: state.comments.status, options: Object.keys(REVIEW_STATUS), displayMap: Object.fromEntries(Object.entries(REVIEW_STATUS).map(([k,v])=>[k,v.label])) })}
-        ${comboFilterHtml({ id: 'cm-source', allLabel: '全部来源', value: state.comments.sourceTag, options: sourceTags })}
+        <label class="tiny muted" style="white-space:nowrap;align-self:center;margin-left:4px">提交时间</label>
+        <input class="input" style="max-width:130px" type="date" id="cm-date-from" value="${esc(state.comments.dateFrom || '')}" placeholder="起始日期">
+        <span class="tiny muted" style="align-self:center">~</span>
+        <input class="input" style="max-width:130px" type="date" id="cm-date-to" value="${esc(state.comments.dateTo || '')}" placeholder="截止日期">
+        ${comboFilterHtml({ id: 'cm-source', allLabel: '来源', value: state.comments.sourceTag, options: sourceTags })}
         <div class="grow"></div>
         <button class="btn btn-sm" id="cm-excel-out">⭳ 导出Excel</button>
         <button class="btn btn-sm" id="cm-excel-in">⭱ 导入Excel</button>
         <button class="btn btn-sm btn-danger" id="cm-batch">🗑 批量删除 (<span id="cm-batch-n">0</span>)</button>
         <button class="btn btn-sm" id="cm-cols" title="列设置">⚙ 列设置</button>
         <button class="btn btn-primary btn-sm" id="cm-add">+ 新增评论</button>
+        <button class="btn btn-sm" id="cm-repair" style="border:1px solid #f59e0b;color:#b45309;background:#fffbeb" title="扫描所有「已评价」订单：评论管理中无记录的自动补建、订单详情评论 tab 为空的自动补全">🔧 补建缺失评论</button>
       </div>
       ${filterTagsHtml('comments')}
       <div class="table-wrap"><table class="data sticky-first-col" data-table="comments"><thead><tr>
@@ -2485,10 +3092,16 @@ async function renderComments(c, keepScroll = false) {
         <th class="col-actions-th"></th>
       </tr></thead><tbody>
         ${pageRows.length ? buildTbody('comments', pageRows, (x) => {
-          const cust = allCustomers.find((cc) => cc.name === x.customerName) || {};
+          const cust = findCustForComment(x);
           const tds = getTableState('comments').filter((col) => !col.hidden).map((col) => {
             let v = '';
             if (col.key === 'customerName') v = `<td><span class="customer-name-link" data-cid="${cust.id || ''}" title="跳转客户详情">${esc(x.customerName)}</span>${x.customerEmail ? `<br><span class="tiny muted">${esc(x.customerEmail)}</span>` : ''}</td>`;
+            else if (col.key === 'coopAttr') {
+              const cnt = Number(cust.cooperationCount || cust.cooperationIndex || 0);
+              const attr = cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作');
+              const cls = cnt <= 0 ? 'neutral' : (cnt === 1 ? 'success' : 'warning');
+              v = `<td><span class="badge badge-${cls}">${attr}</span></td>`;
+            }
             else if (col.key === 'productStore') {
               const parts = [];
               if (x.product) parts.push(esc(x.product));
@@ -2511,7 +3124,7 @@ async function renderComments(c, keepScroll = false) {
               const st = REVIEW_STATUS[x.reviewStatus] || REVIEW_STATUS.pending_invite;
               v = `<td><span class="badge badge-${st.cls}">${st.label}</span></td>`;
             }
-            else if (col.key === 'reviewSubmitDate') v = `<td>${fmtDate(x.reviewSubmitDate)}</td>`;
+            else if (col.key === 'reviewSubmitDate') v = `<td class="cell-ellipsis">${x.reviewSubmitDate ? fmtDate(x.reviewSubmitDate) : '—'}</td>`;
             else if (col.key === 'orderNumber') v = `<td><span class="mono order-link" data-oid="${x.orderId || ''}" data-onum="${esc(x.orderNumber)}">${esc(x.orderNumber) || '—'}</span></td>`;
             else v = `<td>${esc(x[col.key])}</td>`;
             return v;
@@ -2531,11 +3144,17 @@ async function renderComments(c, keepScroll = false) {
   $('#cm-kw').addEventListener('input', (e) => { state.comments.kw = e.target.value; state.comments.displayCount = PAGE; renderComments(c, true); });
   initCombo(c, 'cm-status', { value: state.comments.status, allLabel: '全部状态', options: Object.keys(REVIEW_STATUS), baseOptions: Object.keys(REVIEW_STATUS), displayMap: Object.fromEntries(Object.entries(REVIEW_STATUS).map(([k,v])=>[k,v.label])), onSelect: (v) => { state.comments.status = v; state.comments.displayCount = PAGE; renderComments(c); } });
   initCombo(c, 'cm-source', { value: state.comments.sourceTag, allLabel: '全部来源', options: sourceTags, baseOptions: sourceTags, onSelect: (v) => { state.comments.sourceTag = v; state.comments.displayCount = PAGE; renderComments(c); } });
+  $('#cm-date-from').addEventListener('change', (e) => { state.comments.dateFrom = e.target.value; state.comments.displayCount = PAGE; renderComments(c, true); });
+  $('#cm-date-to').addEventListener('change', (e) => { state.comments.dateTo = e.target.value; state.comments.displayCount = PAGE; renderComments(c, true); });
 
   $('#cm-excel-out').addEventListener('click', () => exportCommentsExcel());
   $('#cm-excel-in').addEventListener('click', () => importCommentsExcel());
   $('#cm-cols').addEventListener('click', () => openColumnSettings('comments', () => renderComments(c, true)));
   $('#cm-add').addEventListener('click', () => openCommentForm(null));
+  $('#cm-repair').addEventListener('click', async () => {
+    if (!confirm('将扫描所有「状态=已评价」的订单：\n• 评论管理中无对应记录的，自动补建到评论管理\n• 订单详情「评论管理」tab 为空的，自动补全\n\n是否继续？')) return;
+    await repairMissingComments();
+  });
 
   // batch delete
   const updateBatchUI = () => {
@@ -2582,6 +3201,7 @@ async function renderComments(c, keepScroll = false) {
   const clearAll = $('[data-clear-all]', c);
   if (clearAll) clearAll.addEventListener('click', () => { clearAllTableFilters(clearAll.dataset.tableKey); renderComments(c); });
   if (!keepScroll) c.scrollTop = 0;
+  forceTableScroll(c);
   restoreFocus(_focusSnap);
 }
 
@@ -2656,8 +3276,8 @@ async function openCommentForm(id) {
   });
 
   // preview & remove existing images
-  $$('.cf-preview-img', m).forEach((img) => img.addEventListener('click', (e) => { if (e.target === img) openImagePreview(img.src); }));
-  $$('.cf-rm-img', m).forEach((btn) => btn.addEventListener('click', (e) => { e.stopPropagation(); btn.parentElement.remove(); }));
+  $$('.cf-preview-img', m.root).forEach((img) => img.addEventListener('click', (e) => { if (e.target === img) openImagePreview(img.src); }));
+  $$('.cf-rm-img', m.root).forEach((btn) => btn.addEventListener('click', (e) => { e.stopPropagation(); btn.parentElement.remove(); }));
 
   // save
   $('#cf-save').addEventListener('click', async () => {
@@ -2692,7 +3312,9 @@ async function openCommentForm(id) {
     };
 
     await putOne('comments', recData);
-    // also sync comment into order's comments[] array
+    // 跨模块联动：评论 -> 对应订单（回写评论内容/截图/提交时间到订单顶层字段）
+    await syncCommentReviewToOrder(recData);
+    // also sync comment into order's comments[] array (保留既有聚合逻辑)
     if (matchedOrder) {
       if (!Array.isArray(matchedOrder.comments)) matchedOrder.comments = [];
       const exists = matchedOrder.comments.findIndex((c) => c.id === recData.id);
@@ -2700,7 +3322,7 @@ async function openCommentForm(id) {
       else matchedOrder.comments.push({ id: recData.id, content: recData.reviewContent, images: recData.images, submitDate: recData.reviewSubmitDate, source: 'comments_page' });
       await syncCommentMirrors(matchedOrder, 'orders');
     }
-    closeAndReopen();
+    m.close();
     toast(isEdit ? '评论已更新' : '评论已创建', 'success');
     render();
   });
@@ -2786,7 +3408,7 @@ async function importCommentsExcel() {
         feedback: String(rowObj.feedback || ''),
         images: shotImgs,
         sourceTag: String(rowObj.sourceTag || rowObj.source || ''),
-        reviewStatus: normStatus(String(rowObj.reviewStatus || rowObj.status || '')),
+        reviewStatus: normReviewStatus(String(rowObj.reviewStatus || rowObj.status || '')),
         rating: parseInt(rowObj.rating, 10) || null,
         reviewSubmitDate: excelDate(rowObj.reviewSubmitDate),
         createdAt: new Date().toISOString(),
@@ -2805,22 +3427,34 @@ async function importCommentsExcel() {
 async function exportCommentsExcel() {
   const all = await fetchComments();
   if (!all.length) return toast('没有评论数据可导出', 'warning');
-  const rows = all.map((x) => ({
-    '订单号': x.orderNumber || '',
-    '客户': x.customerName || '',
-    '邮箱': x.customerEmail || '',
-    '产品': x.product || '',
-    '店铺': x.store || '',
-    '评论内容': x.reviewContent || '',
-    '测评内容/反馈': x.feedback || '',
-    '星级': x.rating || '',
-    '状态': (REVIEW_STATUS[x.reviewStatus] || {}).label || '',
-    '提交时间': x.reviewSubmitDate || '',
-    '来源标签': x.sourceTag || '',
-    '截图': (x.images || []).join('; '),
-  }));
+  const allCustomers = await getAll('customers');
+  const custByName = {}; const custByEmail = {};
+  allCustomers.forEach((cc) => {
+    if (cc.name) custByName[String(cc.name).trim().toLowerCase()] = cc;
+    if (cc.email) custByEmail[String(cc.email).trim().toLowerCase()] = cc;
+  });
+  const rows = all.map((x) => {
+    const cust = custByName[String(x.customerName || '').trim().toLowerCase()] || (x.customerEmail ? custByEmail[String(x.customerEmail || '').trim().toLowerCase()] : null) || {};
+    const cnt = Number(cust.cooperationCount || cust.cooperationIndex || 0);
+    const coopAttr = cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作');
+    return {
+      '订单号': x.orderNumber || '',
+      '客户': x.customerName || '',
+      '合作属性': coopAttr,
+      '邮箱': x.customerEmail || '',
+      '产品': x.product || '',
+      '店铺': x.store || '',
+      '评论内容': x.reviewContent || '',
+      '测评内容/反馈': x.feedback || '',
+      '星级': x.rating || '',
+      '状态': (REVIEW_STATUS[x.reviewStatus] || {}).label || '',
+      '提交时间': x.reviewSubmitDate || '',
+      '来源标签': x.sourceTag || '',
+      '截图': (x.images || []).join('; '),
+    };
+  });
   const ws = XLSX.utils.json_to_sheet(rows);
-  XLSX.utils.sheet_add_aoa(ws, [['订单号','客户','邮箱','产品','店铺','评论内容','测评内容/反馈','星级','状态','提交时间','来源标签','截图']], { origin: 'A1' });
+  XLSX.utils.sheet_add_aoa(ws, [['订单号','客户','合作属性','邮箱','产品','店铺','评论内容','测评内容/反馈','星级','状态','提交时间','来源标签','截图']], { origin: 'A1' });
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '评论列表');
   XLSX.writeFile(wb, `评论导出_${todayISO()}.xlsx`);
   toast(`已导出 ${all.length} 条评论`, 'success');
@@ -2990,6 +3624,17 @@ function normStatus(v) {
   if (['reviewed', '已评价', '已评'].includes(s)) return 'reviewed';
   return 'pending_refund';
 }
+function normReviewStatus(v) {
+  const s = String(v || '').trim().toLowerCase();
+  if (['pending_invite', '待邀约', '待邀请'].includes(s)) return 'pending_invite';
+  if (['published', '已发布', '发布'].includes(s)) return 'published';
+  if (['pending_supplement', '待补差价', '补差价'].includes(s)) return 'pending_supplement';
+  if (['follow_up_review', '追加评价', '追加'].includes(s)) return 'follow_up_review';
+  if (['reviewed', '已评价', '已评'].includes(s)) return 'reviewed';
+  if (['review_lost', '评价丢失', '丢失'].includes(s)) return 'reviewed'; // 兼容旧值
+  if (['declined', '拒绝评价', '拒绝'].includes(s)) return 'pending_invite'; // 兼容旧值
+  return 'pending_invite';
+}
 function pick(row, field) {
   // row keys already normalized to camelCase
   return row[field];
@@ -3148,7 +3793,8 @@ async function exportCustomersExcel() {
     { key: 'name', label: '姓名', wch: 18 }, { key: 'email', label: '邮箱', wch: 24 },
     { key: 'country', label: '国家', wch: 8 }, { key: 'source', label: '来源', wch: 12 },
     { key: 'followers', label: '粉丝数', wch: 10 }, { key: 'product', label: '测评产品', wch: 20 },
-    { key: 'cooperationCount', label: '合作次数', wch: 10 }, { key: 'refundMethod', label: '返款方式', wch: 14 },
+    { key: 'cooperationCount', label: '合作次数', wch: 10 }, { key: 'coopAttr', label: '合作属性', wch: 12 },
+    { key: 'refundMethod', label: '返款方式', wch: 14 },
     { key: 'needShippingAdvance', label: '垫付运费', wch: 10 }, { key: 'ppAccount', label: 'PayPal账号', wch: 22 },
     { key: 'latestFollowUp', label: '最新跟进', wch: 28 }, { key: 'startDate', label: '开始日期', wch: 12 },
     { key: 'lastOrderDate', label: '最新合作日期', wch: 12 }, { key: 'socialMediaUrl', label: '社媒链接', wch: 30 },
@@ -3164,9 +3810,11 @@ async function exportCustomersExcel() {
     for (const c of comments) { if (c.submitDate) { submitDate = c.submitDate; break; } }
     if (!submitDate && comments.length) submitDate = comments[0].submitDate || null;
     if (!submitDate) submitDate = x.reviewSubmitDate || null;
+    const cnt = Number(x.cooperationCount || x.cooperationIndex || 0);
     return {
       ...x,
       needShippingAdvance: x.needShippingAdvance ? '是' : '否',
+      coopAttr: cnt <= 0 ? '—' : (cnt === 1 ? '首次合作' : '再次合作'),
       reviewImages: images.join('\n'),
       reviewContent: content,
       reviewSubmitDate: submitDate,
@@ -3231,6 +3879,199 @@ function syncCommentMirrors(rec, store) {
   rec.reviewSubmitDate = submitDate;
   // 注意：保留 reviewScreenshotUrl / transferScreenshotUrl 等既有字段，不覆盖
   return putOne(store, rec);
+}
+
+/* ---------- 跨模块双向联动：订单 <-> 客户评论管理 (v20260814c) ---------- */
+
+// 方向1：订单保存/修改/删除后，把订单字段同步到 comments store（按订单号匹配）
+// 存在对应评论则更新（仅更新最近一条，避免误改多条手动评论）；不存在且订单含评论数据则自动新建
+async function syncOrderReviewToComments(order) {
+  if (!order) return;
+  const onum = String(order.orderNumber || '').trim().toLowerCase();
+  if (!onum) return;
+  const allComments = await getAll('comments');
+  const matched = allComments
+    .filter((c) => c.orderNumber && String(c.orderNumber).trim().toLowerCase() === onum)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+
+  if (matched.length) {
+    // 更新最近一条关联评论：同步所有关键字段（不仅是评论字段）
+    const target = matched[0];
+    target.reviewContent = order.reviewContent || '';
+    target.images = Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [];
+    target.reviewSubmitDate = order.reviewSubmitDate || null;
+    target.feedback = order.feedback || '';
+    // 同步客户/产品/店铺/状态等全部可变字段
+    if (order.customerName != null) target.customerName = order.customerName;
+    if (order.customerEmail != null) target.customerEmail = order.customerEmail;
+    if (order.product != null) target.product = order.product;
+    if (order.store != null) target.store = order.store;
+    if (order.status != null) {
+      // 订单状态映射到评论状态
+      const statusMap = { pending_refund: 'pending_invite', refunded: 'reviewed', reviewed: 'reviewed' };
+      target.reviewStatus = statusMap[order.status] || target.reviewStatus || 'pending_invite';
+    }
+    if (order.amount != null) target._orderAmount = order.amount;
+    if (order.country != null) target._orderCountry = order.country;
+    target.orderId = order.id;
+    target._orderDeleted = false;
+    target._deletedOrderNumber = '';
+    target.updatedAt = new Date().toISOString();
+    await putOne('comments', target);
+    console.log('[双向联动] 订单→评论：已更新评论(订单号 ' + order.orderNumber + ')');
+    toast('已同步更新评论到「客户评论管理」', 'success');
+    // 同步更新订单内嵌 comments[] 镜像
+    if (!Array.isArray(order.comments)) order.comments = [];
+    const mi = order.comments.findIndex((c) => c.id === target.id);
+    const mirror = { id: target.id, content: target.reviewContent, images: target.images, submitDate: target.reviewSubmitDate, source: 'order_sync' };
+    if (mi >= 0) order.comments[mi] = mirror; else order.comments.push(mirror);
+    await putOne('orders', order);
+    return;
+  }
+
+  // 不存在对应评论 -> 仅当有评论数据时才新建
+  const hasReviewData = Boolean(
+    (order.reviewContent && String(order.reviewContent).trim()) ||
+    (Array.isArray(order.reviewImages) && order.reviewImages.length) ||
+    order.reviewSubmitDate
+  );
+  if (!hasReviewData) return;
+
+  // 不存在对应评论 -> 自动新建一条评论记录
+  const now = new Date().toISOString();
+  const recData = {
+    id: uid(),
+    orderNumber: order.orderNumber,
+    orderId: order.id,
+    customerName: order.customerName || '',
+    customerEmail: order.customerEmail || '',
+    product: order.product || '',
+    store: order.store || '',
+    sourceTag: '',
+    reviewStatus: 'reviewed',
+    rating: null,
+    reviewSubmitDate: order.reviewSubmitDate || null,
+    reviewContent: order.reviewContent || '',
+    feedback: order.feedback || '',
+    images: Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  await putOne('comments', recData);
+  console.log('[双向联动] 订单→评论：已新建评论(订单号 ' + order.orderNumber + ')');
+  toast('已新建 1 条评论到「客户评论管理」', 'success');
+  if (!Array.isArray(order.comments)) order.comments = [];
+  order.comments.push({ id: recData.id, content: recData.reviewContent, images: recData.images, submitDate: recData.reviewSubmitDate, source: 'order_sync' });
+  await putOne('orders', order);
+}
+
+// 一键补建：扫描所有「状态=已评价」的订单，把缺失的评论记录补建到评论管理，
+// 并把订单详情「评论管理」tab 内嵌评论为空的补全（双向数据一致，修复历史断层）
+async function repairMissingComments() {
+  const orders = await getAll('orders');
+  const allComments = await getAll('comments');
+  const reviewed = orders.filter((o) => o.status === 'reviewed');
+  let createdStore = 0, updatedStore = 0, filledEmbedded = 0, skipped = 0;
+  for (const o of reviewed) {
+    const onum = String(o.orderNumber || '').trim().toLowerCase();
+    const hasReviewData = Boolean(
+      (o.reviewContent && String(o.reviewContent).trim()) ||
+      (Array.isArray(o.reviewImages) && o.reviewImages.length) ||
+      o.reviewSubmitDate ||
+      (o.feedback && String(o.feedback).trim())
+    );
+    if (!onum) { skipped++; continue; }
+
+    // 1) comments 表：无记录则补建，有记录则仅在空缺时补全（不覆盖手动录入）
+    const matched = allComments
+      .filter((c) => c.orderNumber && String(c.orderNumber).trim().toLowerCase() === onum)
+      .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+    if (matched.length) {
+      const target = matched[0];
+      target.reviewContent = target.reviewContent || o.reviewContent || '';
+      target.images = (Array.isArray(target.images) && target.images.length) ? target.images : (Array.isArray(o.reviewImages) ? o.reviewImages.slice() : []);
+      target.reviewSubmitDate = target.reviewSubmitDate || o.reviewSubmitDate || null;
+      target.feedback = target.feedback || o.feedback || '';
+      if (target.customerName == null) target.customerName = o.customerName || '';
+      if (target.customerEmail == null) target.customerEmail = o.customerEmail || '';
+      if (target.product == null) target.product = o.product || '';
+      if (target.store == null) target.store = o.store || '';
+      target.reviewStatus = target.reviewStatus || 'reviewed';
+      target.orderId = o.id; target._orderDeleted = false; target._deletedOrderNumber = '';
+      target.updatedAt = new Date().toISOString();
+      await putOne('comments', target);
+      allComments.push(target); // 防止同订单重复创建
+      updatedStore++;
+    } else {
+      if (!hasReviewData) { skipped++; continue; } // 无评价数据的不强行建空记录
+      const now = new Date().toISOString();
+      const rec = {
+        id: uid(), orderNumber: o.orderNumber, orderId: o.id,
+        customerName: o.customerName || '', customerEmail: o.customerEmail || '',
+        product: o.product || '', store: o.store || '', sourceTag: '',
+        reviewStatus: 'reviewed', rating: null,
+        reviewSubmitDate: o.reviewSubmitDate || null,
+        reviewContent: o.reviewContent || '', feedback: o.feedback || '',
+        images: Array.isArray(o.reviewImages) ? o.reviewImages.slice() : [],
+        createdAt: now, updatedAt: now,
+      };
+      await putOne('comments', rec);
+      allComments.push(rec);
+      createdStore++;
+    }
+
+    // 2) 订单内嵌 comments[]：为空且订单有评价数据则补全（让订单详情 tab 不再空白）
+    if (!Array.isArray(o.comments)) o.comments = [];
+    const embeddedHasReview = o.comments.some((c) => (c.content && c.content.trim()) || (Array.isArray(c.images) && c.images.length));
+    if (!embeddedHasReview && hasReviewData) {
+      o.comments.push({
+        id: uid(),
+        content: o.reviewContent || ((Array.isArray(o.reviewImages) && o.reviewImages.length) ? '[评价截图]' : ''),
+        images: Array.isArray(o.reviewImages) ? o.reviewImages.slice() : [],
+        submitDate: o.reviewSubmitDate || null,
+        source: 'order_sync', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      });
+      await putOne('orders', o);
+      filledEmbedded++;
+    }
+  }
+  const msg = `补建完成 ✓ 新建评论 ${createdStore} 条 · 更新 ${updatedStore} 条 · 补全订单内嵌评论 ${filledEmbedded} 条 · 跳过 ${skipped} 条（无订单号/无评价数据）`;
+  toast(msg, 'success');
+  console.log('[补建缺失评论]', msg);
+  render();
+}
+
+// 方向2：评论保存后，把评论信息回写到对应订单的顶层字段（双向同步）
+async function syncCommentReviewToOrder(comment) {
+  if (!comment) return;
+  const orders = await getAll('orders');
+  const ord = comment.orderId
+    ? orders.find((o) => o.id === comment.orderId)
+    : orders.find((o) => o.orderNumber && String(o.orderNumber).trim().toLowerCase() === String(comment.orderNumber || '').trim().toLowerCase());
+  if (!ord) return;
+  // 回写评论内容类字段
+  ord.reviewContent = comment.reviewContent || '';
+  ord.reviewImages = Array.isArray(comment.images) ? comment.images.slice() : [];
+  ord.reviewSubmitDate = comment.reviewSubmitDate || null;
+  ord.feedback = comment.feedback || '';
+  // 回写状态：评论状态 → 订单状态（反向映射）
+  if (comment.reviewStatus) {
+    const revStatusMap = { pending_invite: 'pending_refund', published: 'reviewed', reviewed: 'reviewed', pending_supplement: 'pending_refund', follow_up_review: 'pending_refund' };
+    ord.status = revStatusMap[comment.reviewStatus] || ord.status;
+  }
+  // 回写客户/产品/店铺等可变信息（评论端修改了也要同步到订单）
+  if (comment.customerName != null) ord.customerName = comment.customerName;
+  if (comment.customerEmail != null) ord.customerEmail = comment.customerEmail;
+  if (comment.product != null) ord.product = comment.product;
+  if (comment.store != null) ord.store = comment.store;
+  // 同步更新订单内嵌 comments[] 镜像
+  if (!Array.isArray(ord.comments)) ord.comments = [];
+  const mi = ord.comments.findIndex((c) => c.id === comment.id);
+  const mirror = { id: comment.id, content: comment.reviewContent, images: comment.images, submitDate: comment.reviewSubmitDate, source: 'comments_page' };
+  if (mi >= 0) ord.comments[mi] = mirror; else ord.comments.push(mirror);
+  await putOne('orders', ord);
+  console.log('[双向联动] 评论→订单：已回写订单(订单号 ' + ord.orderNumber + ')');
+  toast('已同步回写到「订单管理」', 'success');
 }
 
 // 一次性迁移守卫：把旧标量字段构造成 comments 数组
@@ -3424,6 +4265,7 @@ function bindCommentItem(paneEl, i, ctx) {
     const rec = await loadRecord(id);
     rec.comments.splice(i, 1);
     await syncCommentMirrors(rec, store);
+    if (store === 'orders') { try { await syncOrderReviewToComments(rec); } catch (e) { console.warn(e); } }
     toast('已删除评论', 'success');
     onChange();
     renderCommentManager(paneEl, ctx);
@@ -3436,6 +4278,7 @@ function bindCommentItem(paneEl, i, ctx) {
     rec.comments[i].submitDate = submitDate;
     rec.comments[i].updatedAt = new Date().toISOString();
     await syncCommentMirrors(rec, store);
+    if (store === 'orders') { try { await syncOrderReviewToComments(rec); } catch (e) { console.warn(e); } }
     toast('已保存', 'success');
     onChange();
   });
@@ -3444,6 +4287,7 @@ function bindCommentItem(paneEl, i, ctx) {
     const rec = await loadRecord(id);
     rec.comments[i].images.splice(j, 1);
     await syncCommentMirrors(rec, store);
+    if (store === 'orders') { try { await syncOrderReviewToComments(rec); } catch (e) { console.warn(e); } }
     onChange();
     renderCommentManager(paneEl, ctx);
   }));
@@ -3506,6 +4350,8 @@ async function renderCommentManager(paneEl, { store, id, loadRecord, onChange })
     if (!Array.isArray(r2.comments)) r2.comments = [];
     r2.comments.push({ id: uid(), content, images: imgs, submitDate, source: 'manual', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     await syncCommentMirrors(r2, store);
+    // 前向同步：订单 tab 新增的评论也写回评论管理页（comments 表）
+    if (store === 'orders') { try { await syncOrderReviewToComments(r2); } catch (e) { console.warn('sync to comments failed', e); } }
     toast('已添加评论', 'success');
     onChange();
     renderCommentManager(paneEl, { store, id, loadRecord, onChange });
@@ -3602,7 +4448,10 @@ function openColumnSettings(key, onChange) {
         <button class="btn btn-sm col-dd" data-key="${c.key}">下拉配置</button>
       </div>`;
     }).join('')}</div>
-    <div class="row mt2" style="gap:10px;justify-content:flex-end"><button class="btn modal-close">关闭</button></div>
+    <div class="row mt2" style="gap:10px;justify-content:flex-end">
+      <button class="btn btn-sm btn-warning" id="col-reset-all">↩ 显示全部列</button>
+      <button class="btn modal-close">关闭</button>
+    </div>
   </div>`;
   const m = openModal(html);
   $$('.col-vis', m.root).forEach((cb) => cb.addEventListener('change', () => {
@@ -3613,6 +4462,13 @@ function openColumnSettings(key, onChange) {
     const col = cols.find((x) => x.key === b.dataset.key);
     if (col) openDropdownConfig(key, col, onChange);
   }));
+  const resetBtn = $('#col-reset-all', m.root);
+  if (resetBtn) resetBtn.addEventListener('click', () => {
+    cols.forEach((c) => { c.hidden = false; });
+    $$('.col-vis', m.root).forEach((cb) => { cb.checked = true; });
+    onChange();
+    toast('已显示全部列', 'success');
+  });
 }
 
 /* ---------- 月度有效评论统计（Chart.js） ---------- */
@@ -3715,12 +4571,914 @@ async function loadSeedData() {
 }
 
 /* ============================================================
+   红人跟进 · Outreach Module (v20260820p)
+   状态机: 待开发→已联系→意向确认→指导下单&退款→已转账→索要好评→(失败)再次索要好评→(成功)已留评
+   意向确认与指导下单&退款均可→放弃；已留评/放弃为终止态
+   ============================================================ */
+
+const OUTREACH_STATUS = {
+  pending:          { label: '待开发',       cls: 'neutral', nextAction: '发破冰私信',   defaultDays: 0 },
+  contacted:        { label: '已联系',       cls: 'warning',  nextAction: '发追单提醒',   defaultDays: 3 },
+  confirmed:        { label: '意向确认',     cls: 'info',     nextAction: '指导下单',     defaultDays: 1 },
+  guiding:          { label: '指导下单&退款', cls: 'info',     nextAction: '跟进下单/退款', defaultDays: 2 },
+  paid:             { label: '已转账',       cls: 'primary',  nextAction: '跟进使用体验', defaultDays: 7 },
+  review_requested: { label: '索要好评',     cls: 'warning',  nextAction: '索评',         defaultDays: 10 },
+  review_retry:     { label: '再次索要好评', cls: 'warning',  nextAction: '二次索评',     defaultDays: 5 },
+  reviewed:         { label: '已留评',       cls: 'success',  nextAction: null,            defaultDays: null },
+  abandoned:        { label: '放弃',         cls: 'muted',    nextAction: null,            defaultDays: null },
+};
+
+const OUTREACH_TRANSITIONS = {
+  pending:          [{ to: 'contacted', label: '已发私信' }],
+  contacted:        [{ to: 'confirmed', label: '已回复-有意' }, { to: 'abandoned', label: '放弃' }],
+  confirmed:        [{ to: 'guiding', label: '指导下单' }, { to: 'abandoned', label: '放弃' }],
+  guiding:          [{ to: 'paid', label: '已转账' }, { to: 'abandoned', label: '放弃' }],
+  paid:             [{ to: 'review_requested', label: '索要好评' }],
+  review_requested: [{ to: 'reviewed', label: '好评成功' }, { to: 'review_retry', label: '索评失败' }],
+  review_retry:     [{ to: 'reviewed', label: '好评成功' }, { to: 'abandoned', label: '放弃' }],
+  reviewed:         [],
+  abandoned:        [],
+};
+
+/* ---------- settings (localStorage-backed, per device) ---------- */
+const OUTREACH_SETTINGS_KEY = 'outreach_settings_v1';
+function getOutreachSettings() {
+  try {
+    const raw = localStorage.getItem(OUTREACH_SETTINGS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  // defaults
+  const defaults = {};
+  Object.entries(OUTREACH_STATUS).forEach(([k, v]) => {
+    defaults[k] = v.defaultDays;
+  });
+  defaults._aiKey = '';
+  defaults._aiEndpoint = 'https://api.openai.com/v1';
+  defaults._aiModel = 'gpt-4o-mini';
+  return defaults;
+}
+function saveOutreachSettings(s) {
+  try { localStorage.setItem(OUTREACH_SETTINGS_KEY, JSON.stringify(s)); } catch (e) {}
+}
+function getOutreachInterval(lead) {
+  const settings = getOutreachSettings();
+  const cfg = OUTREACH_STATUS[lead.status];
+  if (!cfg || cfg.defaultDays == null) return null;
+  // per-lead override > global default
+  if (lead.reminderDays != null && lead.reminderDays !== '') return Number(lead.reminderDays);
+  return settings[lead.status] != null ? settings[lead.status] : cfg.defaultDays;
+}
+
+/* ---------- today's next actions ---------- */
+function computeOutreachActions(leads) {
+  const today = new Date();
+  const todayStr = todayISO();
+  const groups = { A: [], B: [], C: [] };
+  leads.forEach((l) => {
+    if (l.status === 'reviewed' || l.status === 'abandoned') return;
+    if (l.snoozeUntil && new Date(l.snoozeUntil) > today) return;
+    const cfg = OUTREACH_STATUS[l.status];
+    if (!cfg || !cfg.nextAction) return;
+    const interval = getOutreachInterval(l);
+    if (interval == null || interval <= 0) {
+      // immediate action (e.g. pending = 待开发)
+      if (l.status === 'pending') groups.A.push(l);
+      return;
+    }
+    const last = l.lastActionDate ? new Date(l.lastActionDate) : new Date(l.createdAt || todayStr);
+    const diffDays = Math.floor((today - last) / 86400000);
+    if (diffDays >= interval) {
+      if (l.status === 'contacted') groups.B.push({ ...l, overdue: diffDays });
+      else if (['paid', 'review_requested', 'review_retry'].includes(l.status)) groups.C.push({ ...l, overdue: diffDays });
+      else groups.A.push({ ...l, overdue: diffDays });
+    }
+  });
+  return groups;
+}
+
+/* ---------- status badge ---------- */
+function outreachBadge(s) {
+  const m = OUTREACH_STATUS[s] || { label: s || '—', cls: 'neutral' };
+  return `<span class="badge ${m.cls}">${esc(m.label)}</span>`;
+}
+
+/* overdue highlight: deeper red the longer it's overdue */
+function overdueColor(o) {
+  if (!o || o <= 0) return '#e5e7eb';
+  if (o <= 2) return '#fbbf24';
+  if (o <= 4) return '#fb923c';
+  if (o <= 6) return '#f87171';
+  return '#ef4444';
+}
+
+/* ---------- message templates ---------- */
+function outreachMsg(lead, type) {
+  const nick = lead.nickname || 'there';
+  const product = lead.product || 'our aquarium product';
+  const platform = lead.platform || 'social media';
+  const email = lead.email || '';
+  const EN = {
+    icebreaker: `Hi ${nick}! 👋\n\nWe love your content on ${platform}! We're IBAY Aqua, an aquarium brand on Amazon. We'd love to send you a free ${product} in exchange for an honest review.\n\nWould you be interested? Let us know! 🐟`,
+    reminder: `Hi ${nick}! 👋\n\nJust following up on our previous message — we'd love to collaborate with you on a ${product} review. No pressure at all, but if you're interested, just reply and we'll get it shipped out! 🐠`,
+    guide: `Hi ${nick}! 👋\n\nGreat to hear you're interested! Here's how to order:\n\n1. Search for "${product}" on Amazon\n2. Add to cart and checkout normally\n3. Send us the order number and we'll refund you via PayPal after delivery\n\nAny questions? Just ask! 😊`,
+    review_request: `Hi ${nick}! 😊\n\nHope you're enjoying the ${product}! If you've had a chance to try it out, we'd really appreciate it if you could leave a quick review on Amazon. It helps us a lot and means the world to small brands like ours! ⭐\n\nHere's the link: (insert Amazon product link)\n\nThank you so much! 🐟`,
+    review_retry: `Hi ${nick}! 👋\n\nJust a gentle reminder — if you've had a chance to try the ${product}, a quick Amazon review would be incredibly helpful for us. It only takes a minute and really makes a difference for small brands! ⭐\n\nLink: (insert Amazon product link)\n\nThank you! 🐠`,
+    new_product: `Hi ${nick}! 👋\n\nWe just launched a new aquarium product and thought of you right away! Would you like to try it for another review collaboration? Let us know! 🐟`,
+  };
+  const ZH = {
+    icebreaker: `你好 ${nick}！👋\n\n我们在 ${platform} 上看到你的内容，非常喜欢！我们是 IBAY Aqua，亚马逊上的水族品牌。我们想免费寄送一份 ${product} 给你体验，作为交换希望你能留一条真实的评价。\n\n你有兴趣吗？告诉我们！🐟`,
+    reminder: `你好 ${nick}！👋\n\n跟进一下之前的信息——我们很想和你合作 ${product} 的评价。完全没压力，如果你有兴趣，回复我们就可以安排发货！🐠`,
+    guide: `你好 ${nick}！👋\n\n很高兴你有兴趣！下单方式如下：\n\n1. 在亚马逊搜索 "${product}"\n2. 加入购物车并正常下单结账\n3. 把订单号发给我们，收到货后通过 PayPal 退款给你\n\n有问题随时问！😊`,
+    review_request: `你好 ${nick}！😊\n\n希望你喜欢 ${product}！如果已经用上了，我们非常希望你能帮我们在亚马逊留一条简短评价。这对我们帮助很大，对小型品牌意义重大！⭐\n\n链接：（填入亚马逊产品链接）\n\n非常感谢！🐟`,
+    review_retry: `你好 ${nick}！👋\n\n温馨提醒一下——如果你已经体验了 ${product}，一条亚马逊评价对我们来说非常有帮助。只需要一分钟，对小品牌真的意义重大！⭐\n\n链接：（填入亚马逊产品链接）\n\n谢谢！🐠`,
+    new_product: `你好 ${nick}！👋\n\n我们刚推出一款新品水族产品，第一个想到你！你想再合作一次评价吗？告诉我们！🐟`,
+  };
+  const msgType = type || (lead.status === 'pending' ? 'icebreaker'
+    : lead.status === 'contacted' ? 'reminder'
+    : lead.status === 'confirmed' || lead.status === 'guiding' ? 'guide'
+    : lead.status === 'review_requested' ? 'review_request'
+    : lead.status === 'review_retry' ? 'review_retry'
+    : 'icebreaker');
+  return { en: EN[msgType] || EN.icebreaker, zh: ZH[msgType] || ZH.icebreaker, type: msgType, email };
+}
+
+/* ---------- main render ---------- */
+async function renderOutreach(c, keepScroll) {
+  const allLeads = await getAll('leads');
+  // sort: pending first, then by lastActionDate desc
+  allLeads.sort((a, b) => {
+    const order = { pending: 0, contacted: 1, confirmed: 2, guiding: 3, paid: 4, review_requested: 5, review_retry: 6, reviewed: 7, abandoned: 8 };
+    const oa = order[a.status] ?? 9;
+    const ob = order[b.status] ?? 9;
+    if (oa !== ob) return oa - ob;
+    return (b.lastActionDate || '').localeCompare(a.lastActionDate || '');
+  });
+
+  // filter
+  const kw = (state.outreach.kw || '').toLowerCase();
+  const statusFilter = state.outreach.status || '';
+  let leads = allLeads;
+  if (kw) {
+    leads = leads.filter((l) =>
+      [l.nickname, l.platform, l.country, l.product, l.email, l.notes].some((v) =>
+        String(v || '').toLowerCase().includes(kw)
+      )
+    );
+  }
+  if (statusFilter) leads = leads.filter((l) => l.status === statusFilter);
+
+  // today's next actions
+  const actions = computeOutreachActions(allLeads);
+  const totalActions = actions.A.length + actions.B.length + actions.C.length;
+
+  let html = `
+  <style>
+    .o-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+    .o-toolbar .o-search { flex:1; min-width:180px; padding:8px 12px; border:1px solid #ddd; border-radius:8px; font-size:14px; }
+    .o-toolbar select { padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-size:14px; }
+    .o-actions { margin-bottom:16px; }
+    .o-actions-head { font-size:15px; font-weight:700; margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .o-actions-head .count { background:#dc2626; color:#fff; border-radius:50%; min-width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; }
+    .o-actions-head .count.zero { background:#999; }
+    .o-action-group { margin-bottom:12px; }
+    .o-action-group-title { font-size:13px; font-weight:600; color:#666; margin-bottom:6px; }
+    .o-action-items { display:flex; flex-direction:column; gap:6px; }
+    .o-action-item { display:flex; align-items:center; gap:8px; padding:8px 12px; background:#f9f9f9; border-radius:8px; border:1px solid #eee; }
+    .o-action-item .o-nick { font-weight:600; font-size:13px; }
+    .o-action-item .o-meta { font-size:12px; color:#888; }
+    .o-action-item .o-act { margin-left:auto; font-size:12px; color:#0066cc; cursor:pointer; white-space:nowrap; }
+    .o-action-item .o-do { font-size:12px; color:#64748b; margin-top:3px; }
+    .o-action-item .o-act:hover { text-decoration:underline; }
+    .o-action-empty { font-size:13px; color:#999; padding:4px 0; }
+    .o-table { width:100%; border-collapse:collapse; }
+    .o-table th, .o-table td { padding:8px 10px; text-align:left; border-bottom:1px solid #eee; font-size:13px; white-space:nowrap; }
+    .o-table th { background:#f5f5f5; font-weight:600; color:#555; }
+    .o-table tr:hover { background:#fafafa; }
+    .o-platform-ico { font-size:15px; }
+    .o-link { color:#0066cc; text-decoration:none; }
+    .o-link:hover { text-decoration:underline; }
+    .o-act-btns { display:flex; gap:4px; }
+    .o-act-btn { padding:4px 8px; border-radius:6px; font-size:12px; cursor:pointer; border:1px solid #ddd; background:#fff; white-space:nowrap; }
+    .o-act-btn:hover { background:#f0f0f0; }
+    .o-act-btn.primary { background:#111; color:#fff; border-color:#111; }
+    .o-act-btn.primary:hover { background:#333; }
+    .o-act-btn.danger { color:#dc2626; border-color:#dc2626; }
+    .o-act-btn.danger:hover { background:#fef2f2; }
+    /* status-colored action buttons */
+    .o-act-btn.st-pending { background:#475569; color:#fff; border-color:#475569; }
+    .o-act-btn.st-pending:hover { background:#334155; }
+    .o-act-btn.st-contacted { background:#0ea5e9; color:#fff; border-color:#0ea5e9; }
+    .o-act-btn.st-contacted:hover { background:#0284c7; }
+    .o-act-btn.st-confirmed { background:#8b5cf6; color:#fff; border-color:#8b5cf6; }
+    .o-act-btn.st-confirmed:hover { background:#7c3aed; }
+    .o-act-btn.st-guiding { background:#f59e0b; color:#fff; border-color:#f59e0b; }
+    .o-act-btn.st-guiding:hover { background:#d97706; }
+    .o-act-btn.st-paid { background:#22c55e; color:#fff; border-color:#22c55e; }
+    .o-act-btn.st-paid:hover { background:#16a34a; }
+    .o-act-btn.st-review_requested { background:#ec4899; color:#fff; border-color:#ec4899; }
+    .o-act-btn.st-review_requested:hover { background:#db2777; }
+    .o-act-btn.st-review_retry { background:#ef4444; color:#fff; border-color:#ef4444; }
+    .o-act-btn.st-review_retry:hover { background:#dc2626; }
+    .o-act-btn.st-reviewed { background:#14b8a6; color:#fff; border-color:#14b8a6; }
+    .o-act-btn.st-reviewed:hover { background:#0d9488; }
+    .o-act-btn.st-abandoned { background:#94a3b8; color:#fff; border-color:#94a3b8; }
+    .o-act-btn.st-abandoned:hover { background:#64748b; }
+    .o-empty { text-align:center; padding:40px; color:#999; font-size:14px; }
+    .msg-card { border:1px solid #e5e5e5; border-radius:10px; padding:16px; margin-bottom:14px; }
+    .msg-card h4 { font-size:14px; font-weight:700; margin-bottom:8px; }
+    .msg-card textarea { width:100%; min-height:120px; border:1px solid #ddd; border-radius:8px; padding:10px; font-size:13px; line-height:1.6; resize:vertical; }
+    .msg-card .msg-copy-btn { margin-top:8px; padding:8px 18px; background:#111; color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600; }
+    .msg-card .msg-copy-btn:hover { background:#333; }
+    .msg-card .msg-copy-btn.copied { background:#16a34a; }
+    .msg-tabs { display:flex; gap:4px; margin-bottom:10px; }
+    .msg-tab { padding:6px 14px; border-radius:6px; cursor:pointer; font-size:13px; border:1px solid #ddd; background:#fff; }
+    .msg-tab.active { background:#111; color:#fff; border-color:#111; }
+    .o-form-row { display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
+    .o-form-row label { font-size:13px; font-weight:600; min-width:70px; }
+    .o-form-row input, .o-form-row select, .o-form-row textarea { flex:1; min-width:120px; padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-size:14px; }
+    .o-form-row textarea { min-height:60px; }
+    .o-form-full { width:100%; }
+    .o-settings-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+    .o-settings-row label { width:130px; font-size:13px; font-weight:600; }
+    .o-settings-row input { width:60px; padding:6px 8px; border:1px solid #ddd; border-radius:6px; text-align:center; }
+    .o-settings-row .hint { font-size:12px; color:#999; }
+    .ai-tip { font-size:12.5px; color:#555; line-height:1.6; background:#f6f8fa; border-radius:10px; padding:10px 12px; margin-bottom:12px; }
+    .ai-input { width:100%; min-height:120px; padding:10px 12px; border:1px solid #ddd; border-radius:10px; font-size:13.5px; line-height:1.6; resize:vertical; font-family:inherit; }
+    .ai-status { font-size:12.5px; color:#2563eb; margin-left:6px; }
+    .ai-summary { background:#eef6ff; border:1px solid #cfe3ff; border-left:4px solid #2563eb; border-radius:10px; padding:10px 12px; font-size:13px; color:#0f3d6e; line-height:1.6; margin-bottom:12px; white-space:pre-wrap; }
+    .ai-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 14px; }
+    .ai-cell { display:flex; flex-direction:column; gap:4px; }
+    .ai-cell label { font-size:12px; font-weight:600; color:#444; }
+    .ai-cell input, .ai-cell select, .ai-cell textarea { padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-size:13.5px; font-family:inherit; }
+    .ai-cell textarea { min-height:54px; resize:vertical; grid-column:1/-1; }
+  </style>
+  <div class="o-toolbar">
+    <button class="o-act-btn primary" data-o-act="new">+ 新发现</button>
+    <button class="o-act-btn" data-o-act="settings">⚙ 跟进设置</button>
+    <button class="o-act-btn" id="o-ai-lead">🤖 AI录入</button>
+    <input class="o-search" type="text" placeholder="搜索昵称/平台/国家/产品/邮箱/备注…" value="${esc(state.outreach.kw || '')}" data-o-input="search">
+    <select data-o-input="status">
+      <option value="">全部状态</option>
+      ${Object.entries(OUTREACH_STATUS).map(([k, v]) => `<option value="${k}" ${statusFilter === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}
+    </select>
+    <span style="font-size:12px;color:#888">共 ${leads.length} 条</span>
+  </div>
+  `;
+
+  // today's next actions panel
+  html += `<div class="o-actions">`;
+  html += `<div class="o-actions-head">今日下一步 ${totalActions > 0 ? `<span class="count">${totalActions}</span>` : '<span class="count zero">0</span>'}</div>`;
+  if (totalActions === 0) {
+    html += `<div class="o-action-empty">🎉 暂无待办，所有红人都在跟进中</div>`;
+  } else {
+    if (actions.A.length) {
+      html += `<div class="o-action-group"><div class="o-action-group-title">A · 发私信 / 指导下单 (${actions.A.length})</div><div class="o-action-items">`;
+      actions.A.forEach((l) => {
+        html += `<div class="o-action-item" style="align-items:flex-start;border-left:4px solid ${overdueColor(l.overdue)}"><div style="flex:1;min-width:0"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><div class="o-do">→ ${esc(OUTREACH_STATUS[l.status]?.nextAction || '处理')}${l.overdue ? ` · 超 ${l.overdue} 天` : ''}</div></div><div class="o-act-btns"><button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${OUTREACH_TRANSITIONS[l.status]?.[0]?.to || ''}">推进</button><button class="o-act-btn" data-o-act="go-msg" data-id="${esc(l.id)}">生成消息</button><button class="o-act-btn" data-o-act="snooze" data-id="${esc(l.id)}">延后3天</button></div></div>`;
+      });
+      html += `</div></div>`;
+    }
+    if (actions.B.length) {
+      html += `<div class="o-action-group"><div class="o-action-group-title">B · 未回复追单 (${actions.B.length})</div><div class="o-action-items">`;
+      actions.B.forEach((l) => {
+        html += `<div class="o-action-item" style="align-items:flex-start;border-left:4px solid ${overdueColor(l.overdue)}"><div style="flex:1;min-width:0"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><div class="o-do">→ ${esc(OUTREACH_STATUS[l.status]?.nextAction || '发提醒')} · 超 ${l.overdue || 0} 天</div></div><div class="o-act-btns"><button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${OUTREACH_TRANSITIONS[l.status]?.[0]?.to || ''}">推进</button><button class="o-act-btn" data-o-act="go-msg" data-id="${esc(l.id)}">生成消息</button><button class="o-act-btn" data-o-act="snooze" data-id="${esc(l.id)}">延后3天</button></div></div>`;
+      });
+      html += `</div></div>`;
+    }
+    if (actions.C.length) {
+      html += `<div class="o-action-group"><div class="o-action-group-title">C · 索评跟进 (${actions.C.length})</div><div class="o-action-items">`;
+      actions.C.forEach((l) => {
+        html += `<div class="o-action-item" style="align-items:flex-start;border-left:4px solid ${overdueColor(l.overdue)}"><div style="flex:1;min-width:0"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><div class="o-do">→ ${esc(OUTREACH_STATUS[l.status]?.nextAction || '索评')} · 超 ${l.overdue || 0} 天</div></div><div class="o-act-btns"><button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${OUTREACH_TRANSITIONS[l.status]?.[0]?.to || ''}">推进</button><button class="o-act-btn" data-o-act="go-msg" data-id="${esc(l.id)}">生成消息</button><button class="o-act-btn" data-o-act="snooze" data-id="${esc(l.id)}">延后3天</button></div></div>`;
+      });
+      html += `</div></div>`;
+    }
+  }
+  html += `</div>`;
+
+  // leads table
+  if (leads.length === 0) {
+    html += `<div class="o-empty">还没有红人记录，点「+ 新发现」开始</div>`;
+  } else {
+    html += `<div class="table-wrap"><table class="data o-table"><thead><tr>
+      <th>平台</th><th>昵称</th><th>链接</th><th>国家</th><th>产品</th><th>邮箱</th><th>状态</th><th>最后操作</th><th>操作</th>
+    </tr></thead><tbody>`;
+    leads.forEach((l) => {
+      const url = l.profileUrl || '';
+      const linkDisplay = url ? `<a class="o-link" href="${esc(url)}" target="_blank" rel="noopener">${esc(url.replace(/^https?:\/\//, '').slice(0, 30))}${url.length > 35 ? '…' : ''}</a>` : '—';
+      const transitions = OUTREACH_TRANSITIONS[l.status] || [];
+      html += `<tr data-o-act="row" data-id="${esc(l.id)}" style="cursor:pointer">
+        <td>${esc(platformIcon(l.platform))} ${esc(l.platform || '—')}</td>
+        <td><strong>${esc(l.nickname || '—')}</strong></td>
+        <td>${linkDisplay}</td>
+        <td>${esc(l.country || '—')}</td>
+        <td>${esc(l.product || '—')}</td>
+        <td>${l.email ? `<a class="o-link" href="mailto:${esc(l.email)}">${esc(l.email)}</a>` : '—'}</td>
+        <td>${outreachBadge(l.status)}</td>
+        <td>${esc(fmtDate(l.lastActionDate || l.createdAt))}</td>
+        <td><div class="o-act-btns" onclick="event.stopPropagation()">
+          ${transitions.map((t) => `<button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${esc(t.to)}">${esc(t.label)}</button>`).join('')}
+          <button class="o-act-btn" data-o-act="msg" data-id="${esc(l.id)}">消息</button>
+          <button class="o-act-btn" data-o-act="edit" data-id="${esc(l.id)}">编辑</button>
+          <button class="o-act-btn danger" data-o-act="delete" data-id="${esc(l.id)}">删除</button>
+        </div></td>
+      </tr>`;
+    });
+    html += `</tbody></table></div>`;
+  }
+
+  c.innerHTML = html;
+
+  // bind events
+  const searchInput = $('[data-o-input="search"]', c);
+  if (searchInput) {
+    let searchTimer;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        state.outreach.kw = searchInput.value;
+        renderOutreach(c, true);
+      }, 250);
+    });
+  }
+  const statusSel = $('[data-o-input="status"]', c);
+  if (statusSel) {
+    statusSel.addEventListener('change', () => {
+      state.outreach.status = statusSel.value;
+      renderOutreach(c, true);
+    });
+  }
+  const oAiLead = $('#o-ai-lead', c);
+  if (oAiLead) oAiLead.addEventListener('click', () => openAIExtractModal('lead'));
+  // button delegations
+  $$('[data-o-act]', c).forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const act = btn.dataset.oAct;
+      const id = btn.dataset.id;
+      if (act === 'new') openLeadForm(null);
+      else if (act === 'settings') openFollowSettings();
+      else if (act === 'edit' || act === 'row') { const lead = allLeads.find((x) => x.id === id); if (lead) openLeadForm(lead); }
+      else if (act === 'delete') deleteLead(id);
+      else if (act === 'transition') transitionLead(id, btn.dataset.to);
+      else if (act === 'msg') { const lead = allLeads.find((x) => x.id === id); if (lead) openMessageGen(lead); }
+      else if (act === 'go-msg') { const lead = allLeads.find((x) => x.id === id); if (lead) openMessageGen(lead); }
+      else if (act === 'snooze') {
+        const lead = allLeads.find((x) => x.id === id);
+        if (lead) {
+          const d = new Date();
+          d.setDate(d.getDate() + 3);
+          lead.snoozeUntil = d.toISOString();
+          lead.updatedAt = new Date().toISOString();
+          await putOne('leads', lead);
+          toast('已延后 3 天跟进', 'success');
+          render();
+        }
+      }
+    });
+  });
+}
+
+/* ---------- platform icon ---------- */
+function platformIcon(platform) {
+  const p = String(platform || '').toLowerCase();
+  if (p.includes('instagram')) return '📷';
+  if (p.includes('tiktok')) return '🎵';
+  if (p.includes('youtube') || p.includes('yt')) return '▶️';
+  if (p.includes('facebook') || p.includes('fb')) return '👥';
+  if (p.includes('twitter') || p.includes('x.com')) return '🐦';
+  if (p.includes('pinterest')) return '📌';
+  if (p.includes('reddit')) return '🤖';
+  if (p.includes('blog') || p.includes('web')) return '🌐';
+  return '👤';
+}
+
+/* ---------- new / edit form ---------- */
+function openLeadForm(lead, opts = {}) {
+  const isEdit = !!lead && !opts.prefill;
+  const l = lead || { platform: 'TikTok', nickname: '', profileUrl: '', country: '', product: '', email: '', notes: '', reminderDays: '' };
+  const platforms = ['TikTok', 'Instagram', 'YouTube', 'Facebook', 'Twitter/X', 'Pinterest', 'Reddit', 'Blog', 'Other'];
+  const statusKeys = Object.keys(OUTREACH_STATUS);
+  const html = `
+    <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">${isEdit ? '编辑红人' : '+ 新发现红人'}</h3>
+    <div class="o-form-row">
+      <label>平台</label>
+      <select id="lf-platform">
+        ${platforms.map((p) => `<option value="${p}" ${l.platform === p ? 'selected' : ''}>${p}</option>`).join('')}
+      </select>
+    </div>
+    <div class="o-form-row">
+      <label>昵称</label>
+      <input type="text" id="lf-nick" value="${esc(l.nickname || '')}" placeholder="红人昵称">
+    </div>
+    <div class="o-form-row">
+      <label>主页链接</label>
+      <input type="url" id="lf-url" value="${esc(l.profileUrl || '')}" placeholder="https://...">
+    </div>
+    <div class="o-form-row">
+      <label>国家</label>
+      <input type="text" id="lf-country" value="${esc(l.country || '')}" placeholder="US / DE / UK ...">
+    </div>
+    <div class="o-form-row">
+      <label>产品</label>
+      <input type="text" id="lf-product" value="${esc(l.product || '')}" placeholder="关联产品名称">
+    </div>
+    <div class="o-form-row">
+      <label>邮箱</label>
+      <input type="email" id="lf-email" value="${esc(l.email || '')}" placeholder="email@example.com">
+    </div>
+    ${isEdit ? `
+    <div class="o-form-row">
+      <label>状态</label>
+      <select id="lf-status">
+        ${statusKeys.map((k) => `<option value="${k}" ${l.status === k ? 'selected' : ''}>${esc(OUTREACH_STATUS[k].label)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="o-form-row">
+      <label>下次提醒间隔</label>
+      <input type="number" id="lf-days" value="${l.reminderDays != null ? l.reminderDays : ''}" placeholder="留空=用全局默认" min="0" max="365">
+      <span style="font-size:12px;color:#999">天 · 上次操作后几天提醒（0=每天）</span>
+    </div>
+    <div style="font-size:12px;color:#2563eb;margin:-4px 0 10px 80px" id="lf-next-hint"></div>
+  ` : ''}
+    <div class="o-form-row">
+      <label>备注</label>
+      <textarea id="lf-notes" placeholder="备注信息…">${esc(l.notes || '')}</textarea>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="o-act-btn primary" style="flex:1;padding:10px" id="lf-save">${isEdit ? '保存' : '创建'}</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" id="lf-cancel">取消</button>
+    </div>
+  `;
+  const { close } = openModal(html);
+  $('#lf-cancel').addEventListener('click', close);
+  const lfDays = $('#lf-days');
+  if (lfDays) {
+    const updateHint = () => {
+      const v = lfDays.value.trim();
+      const days = v === '' ? (getOutreachSettings()[l.status] ?? OUTREACH_STATUS[l.status].defaultDays) : Number(v);
+      let txt = '—';
+      if (days === 0) txt = '每天提醒（无需等待）';
+      else if (!isNaN(days) && days > 0) {
+        const base = new Date(l.lastActionDate || l.createdAt || Date.now());
+        base.setDate(base.getDate() + days);
+        txt = '预计下次提醒：' + fmtDate(base.toISOString());
+      }
+      const hint = $('#lf-next-hint');
+      if (hint) hint.textContent = txt;
+    };
+    lfDays.addEventListener('input', updateHint);
+    updateHint();
+  }
+  $('#lf-save').addEventListener('click', async () => {
+    const data = {
+      platform: $('#lf-platform').value,
+      nickname: $('#lf-nick').value.trim(),
+      profileUrl: $('#lf-url').value.trim(),
+      country: $('#lf-country').value.trim(),
+      product: $('#lf-product').value.trim(),
+      email: $('#lf-email').value.trim(),
+      notes: $('#lf-notes').value.trim(),
+    };
+    if (!data.nickname) { toast('请填写昵称', 'error'); return; }
+    if (isEdit) {
+      data.id = lead.id;
+      const newStatus = $('#lf-status') ? $('#lf-status').value : lead.status;
+      const statusChanged = newStatus !== lead.status;
+      data.status = newStatus;
+      data.lastActionDate = statusChanged ? new Date().toISOString() : (lead.lastActionDate || lead.createdAt);
+      data.createdAt = lead.createdAt;
+      data.updatedAt = new Date().toISOString();
+      data.reminderDays = $('#lf-days') ? $('#lf-days').value : lead.reminderDays;
+      data.commLog = lead.commLog || [];
+      if (statusChanged) {
+        const ts = new Date().toISOString();
+        data.commLog.push({ ts, date: ts.slice(0, 10), action: `状态: ${OUTREACH_STATUS[lead.status]?.label || lead.status} → ${OUTREACH_STATUS[newStatus]?.label || newStatus}`, detail: '通过编辑表单修改' });
+      }
+      await putOne('leads', data);
+      toast('已保存', 'success');
+    } else {
+      data.id = uid();
+      data.status = (lead && OUTREACH_STATUS[lead.status]) ? lead.status : 'pending';
+      const now = new Date().toISOString();
+      data.lastActionDate = now;
+      data.createdAt = now;
+      data.updatedAt = now;
+      data.commLog = [{ ts: now, date: now.slice(0, 10), action: '创建', detail: '新发现红人' }];
+      await putOne('leads', data);
+      toast('已创建，状态：待开发', 'success');
+    }
+    close();
+    render();
+  });
+}
+
+/* ---------- 🤖 AI 录入（粘贴聊天→提取→填表）---------- */
+
+// 本地正则兜底提取：无 AI Key 时也能抓出明显字段
+function localExtract(text, kind) {
+  const t = text || '';
+  const out = {};
+  // 邮箱（订单字段名 = customerEmail，红人字段名 = email）
+  const email = (t.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || [])[0] || '';
+  if (email) { if (kind === 'order') out.customerEmail = email; else out.email = email; }
+  // 链接（订单字段名 = socialMediaUrl，红人字段名 = profileUrl）
+  const url = (t.match(/https?:\/\/[^\s)'"]+/gi) || [])[0] || '';
+  if (url) { if (kind === 'order') out.socialMediaUrl = url; else out.profileUrl = url; }
+  // 平台识别
+  const lower = t.toLowerCase();
+  let platform = '';
+  if (/tiktok/.test(lower)) platform = 'TikTok';
+  else if (/instagram|ig\b/.test(lower)) platform = 'Instagram';
+  else if (/youtube/.test(lower)) platform = 'YouTube';
+  else if (/facebook|fb\b/.test(lower)) platform = 'Facebook';
+  else if (/twitter|x\.com/.test(lower)) platform = 'Twitter/X';
+  else if (/pinterest/.test(lower)) platform = 'Pinterest';
+  else if (/reddit/.test(lower)) platform = 'Reddit';
+  else if (/blog/.test(lower)) platform = 'Blog';
+  if (platform) out.platform = platform;
+  // 金额 + 货币
+  const curMap = [['¥', 'CNY'], ['￥', 'CNY'], ['RMB', 'CNY'], ['CNY', 'CNY'], ['€', 'EUR'], ['EUR', 'EUR'], ['£', 'GBP'], ['GBP', 'GBP'], ['\\$', 'USD'], ['USD', 'USD']];
+  let cur = '', amt = '';
+  for (const [sym, code] of curMap) {
+    const m = t.match(new RegExp(sym + '\\s?(\\d+(?:[.,]\\d{1,2})?)'));
+    if (m) { cur = code; amt = m[1].replace(',', '.'); break; }
+  }
+  if (!amt) { const m = t.match(/(?:^|\s)(\d+(?:[.,]\d{1,2})?)\s*(?:usd|eur|gbp|cny|rmb|美元|欧|镑)/i); if (m) { amt = m[1].replace(',', '.'); cur = (m[2] || '').toUpperCase() || 'USD'; } }
+  if (amt) { out.amount = amt; out.currency = cur || 'USD'; }
+  // 订单号
+  const onum = (t.match(/#\s?([A-Za-z0-9][\w-]{4,})/)) || (t.match(/(?:订单号|order\s*(?:#|no)?\.?\s*[:：]?\s*)([A-Za-z0-9][\w-]{4,})/i)) || (t.match(/\b(\d{6,})\b/));
+  if (onum) out.orderNumber = onum[1];
+  // 店铺
+  const store = t.match(/\b((?:HS|IB)[-\s]?(?:US|UK|DE|AU|CA|FR|IT|ES))\b/i);
+  if (store) out.store = store[1].toUpperCase().replace(/\s/, '-');
+  // 国家
+  const ctry = t.match(/\b(US|USA|United States|DE|Germany|UK|United Kingdom|GB|AU|Australia|CA|Canada|FR|France|IT|Italy|ES|Spain|JP|Japan)\b/i);
+  if (ctry) {
+    const map = { usa: 'US', 'united states': 'US', uk: 'UK', 'united kingdom': 'UK', gb: 'UK', de: 'DE', germany: 'DE', au: 'AU', australia: 'AU', ca: 'CA', canada: 'CA', fr: 'FR', france: 'FR', it: 'IT', italy: 'IT', es: 'ES', spain: 'ES', jp: 'JP', japan: 'JP' };
+    out.country = map[ctry[1].toLowerCase()] || ctry[1].toUpperCase();
+  }
+  // 返款方式
+  if (/paypal/i.test(t)) { out.refundMethod = 'PayPal'; if (email) out.ppAccount = email; }
+  else if (/银行|bank/i.test(t)) out.refundMethod = '银行转账';
+  else if (/平台退款|refund/i.test(t)) out.refundMethod = '平台退款';
+  // 客户名 / 昵称
+  const nameM = t.match(/(?:客户|customer|name|姓名|昵称)[\s：:]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|$)/i);
+  if (nameM) { const nm = nameM[1].trim(); if (kind === 'lead') out.nickname = nm; else out.customerName = nm; }
+  else if (kind === 'lead') { const at = t.match(/@([\w.]{3,30})/); if (at) out.nickname = at[1]; }
+  // 产品
+  const prodM = t.match(/(?:产品|product|买了|purchase)[\s：:]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{1,30}?)(?:\n|$|\.)/i);
+  if (prodM) out.product = prodM[1].trim();
+  // 状态默认值
+  out.status = kind === 'lead' ? 'pending' : 'pending_refund';
+  // 关键信息摘要
+  const found = [];
+  if (out.orderNumber) found.push('订单号 ' + out.orderNumber);
+  if (out.customerName || out.nickname) found.push('姓名 ' + (out.customerName || out.nickname));
+  if (out.email || out.customerEmail) found.push('邮箱 ' + (out.email || out.customerEmail));
+  if (out.amount) found.push('金额 ' + out.currency + ' ' + out.amount);
+  if (out.country) found.push('国家 ' + out.country);
+  if (out.store) found.push('店铺 ' + out.store);
+  if (out.platform) found.push('平台 ' + out.platform);
+  let summary = found.length ? ('已识别：' + found.join('；') + '。') : '未识别到明显字段。';
+  summary += ' 其余字段请手动补充后保存。';
+  return { fields: out, summary, source: 'local' };
+}
+
+// 调用 AI 提取（OpenAI 兼容）；失败或无 Key 时回退本地提取
+async function callAIExtract(text, kind) {
+  const s = getOutreachSettings();
+  const key = (s._aiKey || '').trim();
+  if (!key) return { ...localExtract(text, kind), source: 'local' };
+  const endpoint = (s._aiEndpoint || 'https://api.openai.com/v1').replace(/\/$/, '');
+  const model = (s._aiModel || 'gpt-4o-mini').trim();
+  const fieldList = kind === 'order'
+    ? ['orderNumber', 'customerName', 'customerEmail', 'store', 'product', 'amount', 'currency', 'country', 'socialMediaUrl', 'refundMethod', 'ppAccount', 'status', 'reviewContent']
+    : ['platform', 'nickname', 'profileUrl', 'country', 'product', 'email', 'status'];
+  const sys = `You are a data extraction assistant for an aquarium influencer/order management system. The user pastes a chat with a customer or influencer. Extract structured fields and return ONLY valid JSON: {"fields":{...},"summary":"key points in Chinese"}.
+Field names when present: ${fieldList.join(', ')}.
+- Missing fields => empty string "".
+- order "status": one of pending_refund, transferred, reviewing, completed, abandoned.
+- lead "status": one of pending, contacted, confirmed, guiding, paid, review_requested, review_retry, reviewed, abandoned.
+- "amount": number as string. "currency": USD/EUR/GBP/CNY.
+- "summary": 2-3 short Chinese sentences on what matters (e.g. 客户已收货等待索评 / 对退款方式有疑问 / 红人为TikTok新发现).`;
+  try {
+    const resp = await fetch(`${endpoint}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+      body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, { role: 'user', content: text }], temperature: 0.2, response_format: { type: 'json_object' } }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '{}';
+    const parsed = JSON.parse(content);
+    const fields = parsed.fields || {};
+    if (kind === 'lead' && fields.profileUrl == null && fields.socialMediaUrl != null) fields.profileUrl = fields.socialMediaUrl;
+    if (kind === 'order' && fields.socialMediaUrl == null && fields.profileUrl != null) fields.socialMediaUrl = fields.profileUrl;
+    return { fields, summary: parsed.summary || '', source: 'ai' };
+  } catch (e) {
+    console.warn('AI 提取失败，回退本地规则：', e);
+    return { ...localExtract(text, kind), source: 'local', aiError: true };
+  }
+}
+
+// AI 录入弹窗
+function openAIExtractModal(kind) {
+  const isOrder = kind === 'order';
+  const title = isOrder ? '🤖 AI 录入 · 订单' : '🤖 AI 录入 · 红人';
+  const defs = isOrder
+    ? [['orderNumber', '订单号'], ['customerName', '客户名称'], ['customerEmail', '客户邮箱'], ['store', '店铺'], ['product', '产品'], ['amount', '金额'], ['currency', '货币'], ['country', '国家'], ['socialMediaUrl', '社媒链接'], ['refundMethod', '返款方式'], ['ppAccount', 'PayPal'], ['reviewContent', '测评文案']]
+    : [['platform', '平台'], ['nickname', '昵称'], ['profileUrl', '主页链接'], ['country', '国家'], ['product', '产品'], ['email', '邮箱']];
+  const statusOpts = isOrder
+    ? Object.entries(STATUS).map(([k, m]) => `<option value="${k}">${esc(m.label)}</option>`).join('')
+    : Object.keys(OUTREACH_STATUS).map((k) => `<option value="${k}">${esc(OUTREACH_STATUS[k].label)}</option>`).join('');
+  let html = `
+    <div class="modal-head"><h3>${title}</h3><button class="x-btn modal-close">×</button></div>
+    <div class="modal-body">
+      <p class="ai-tip">粘贴你与客户的聊天记录（微信 / 邮件 / 社媒私信均可），点「分析提取」自动识别关键信息并填入下方。无 AI 密钥时用本地规则提取明显字段，其余请手动补充。</p>
+      <textarea id="ai-input" class="ai-input" placeholder="在此粘贴聊天记录…"></textarea>
+      <div style="margin-top:10px"><button class="o-act-btn primary" id="ai-run">🔍 分析提取</button> <span id="ai-status" class="ai-status"></span></div>
+      <div id="ai-result" style="display:none;margin-top:14px">
+        <div class="ai-summary" id="ai-summary"></div>
+        <div class="ai-grid" id="ai-grid"></div>
+        <div style="display:flex;gap:10px;margin-top:14px">
+          <button class="o-act-btn primary" id="ai-save">${isOrder ? '💾 保存为订单' : '💾 保存为红人'}</button>
+          <button class="o-act-btn" id="ai-rerun">重新分析</button>
+          <button class="o-act-btn" id="ai-cancel">取消</button>
+        </div>
+      </div>
+    </div>`;
+  const { close } = openModal(html, { wide: true });
+  const input = $('#ai-input');
+  const resultBox = $('#ai-result');
+  const statusEl = $('#ai-status');
+  let lastFields = {};
+
+  const renderGrid = (fields) => {
+    lastFields = fields || {};
+    const grid = $('#ai-grid');
+    grid.innerHTML = defs.map(([k, label]) => {
+      const val = lastFields[k] != null ? lastFields[k] : '';
+      const isStatus = k === 'status';
+      const isArea = k === 'reviewContent';
+      const id = isStatus ? 'ai-status-sel' : 'ai-' + k;
+      const control = isStatus
+        ? `<select id="${id}">${statusOpts}</select>`
+        : isArea
+          ? `<textarea id="${id}" placeholder="${label}">${esc(val)}</textarea>`
+          : `<input id="${id}" value="${esc(val)}" placeholder="${label}">`;
+      return `<div class="ai-cell"><label>${esc(label)}</label>${control}</div>`;
+    }).join('');
+    const st = $('#ai-status-sel'); if (st && lastFields.status) st.value = lastFields.status;
+    resultBox.style.display = 'block';
+  };
+
+  const run = async () => {
+    const txt = input.value.trim();
+    if (!txt) { toast('请先粘贴聊天记录', 'error'); return; }
+    statusEl.textContent = '分析中…';
+    const r = await callAIExtract(txt, kind);
+    statusEl.textContent = r.source === 'ai' ? '✅ AI 提取完成' : (r.aiError ? '⚠️ AI 失败，已用本地规则' : '✅ 本地规则提取');
+    $('#ai-summary').textContent = r.summary || '';
+    renderGrid(r.fields);
+  };
+
+  $('#ai-run').addEventListener('click', run);
+  $('#ai-rerun').addEventListener('click', run);
+  $('#ai-cancel').addEventListener('click', close);
+
+  $('#ai-save').addEventListener('click', () => {
+    const f = {};
+    defs.forEach(([k]) => {
+      const id = k === 'status' ? 'ai-status-sel' : 'ai-' + k;
+      const el = $('#' + id); if (el) f[k] = el.value.trim();
+    });
+    if (isOrder) {
+      const prefill = {
+        __raw: true,
+        orderNumber: f.orderNumber, customerName: f.customerName, customerEmail: f.customerEmail,
+        store: f.store, product: f.product, amount: f.amount ? Number(f.amount) : 0, currency: f.currency,
+        country: f.country, socialMediaUrl: f.socialMediaUrl, refundMethod: f.refundMethod,
+        ppAccount: f.ppAccount, reviewContent: f.reviewContent, status: f.status || 'pending_refund',
+        orderDate: todayISO(),
+      };
+      close();
+      openOrderForm(null, prefill);
+    } else {
+      const prefill = { platform: f.platform || 'TikTok', nickname: f.nickname, profileUrl: f.profileUrl, country: f.country, product: f.product, email: f.email, status: f.status || 'pending' };
+      close();
+      openLeadForm(prefill, { prefill: true });
+    }
+  });
+}
+
+/* ---------- ⚙ follow settings ---------- */
+function openFollowSettings() {
+  const settings = getOutreachSettings();
+  const editable = Object.entries(OUTREACH_STATUS).filter(([, v]) => v.defaultDays != null);
+  let html = `
+    <h3 style="font-size:18px;font-weight:700;margin-bottom:6px">⚙ 智能跟进提醒</h3>
+    <div style="font-size:13px;color:#555;line-height:1.7;background:#f6f8fa;border-radius:10px;padding:12px 14px;margin-bottom:16px">
+      <b>它怎么工作：</b>每个状态设一个「间隔天数」= 上次操作后，等几天再提醒你跟进。例如「已联系=3天」表示：联系后若超过 3 天没新动作，这个人会出现在首页「今日下一步」提醒你。<br>
+      <b>有人需要放养？</b>在红人编辑页可单独调「下次提醒间隔」，覆盖这里的全局默认值。
+    </div>
+    <div style="display:flex;gap:10px;font-size:12px;color:#888;margin-bottom:8px;font-weight:600">
+      <div style="width:96px">状态</div>
+      <div style="width:64px;text-align:center">间隔(天)</div>
+      <div style="flex:1">到期动作（到点后提醒你做什么）</div>
+    </div>
+    ${editable.map(([key, cfg]) => `
+      <div class="o-settings-row" style="align-items:flex-start">
+        <label style="width:96px">${esc(cfg.label)}</label>
+        <input type="number" min="0" max="365" id="fs-${key}" value="${settings[key] ?? cfg.defaultDays}" style="width: 64px;text-align:center">
+        <span class="hint" style="flex: 1">${cfg.nextAction ? '→ 到期提醒：' + esc(cfg.nextAction) : ''}</span>
+      </div>
+    `).join('')}
+    <div style="font-size:12px;color:#94a3b8;margin:6px 0 0 106px">0 = 每天提醒（如「待开发」需立刻私信）；留空则沿用上方数值</div>
+    <hr style="margin:16px 0;border:none;border-top:1px solid #eee">
+    <div class="o-settings-row">
+      <label style="width:96px">AI 接口地址</label>
+      <input type="text" id="fs-aiendpoint" value="${esc(settings._aiEndpoint || 'https://api.openai.com/v1')}" placeholder="https://api.openai.com/v1" style="width:280px;text-align:left">
+      <span class="hint">OpenAI 或兼容接口</span>
+    </div>
+    <div class="o-settings-row">
+      <label style="width:96px">AI 模型</label>
+      <input type="text" id="fs-aimodel" value="${esc(settings._aiModel || 'gpt-4o-mini')}" placeholder="gpt-4o-mini" style="width:200px;text-align:left">
+      <span class="hint">如 gpt-4o-mini</span>
+    </div>
+    <div class="o-settings-row">
+      <label style="width:96px">AI 密钥</label>
+      <input type="password" id="fs-aikey" value="${esc(settings._aiKey || '')}" placeholder="留空=仅用本地提取" style="width:280px;text-align:left">
+      <span class="hint">可选（用于「🤖 AI录入」与话术重写）</span>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:20px">
+      <button class="o-act-btn primary" style="flex:1;padding:10px" id="fs-save">保存设置</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" id="fs-close">关闭</button>
+    </div>
+  `;
+  const { close } = openModal(html);
+  $('#fs-close').addEventListener('click', close);
+  $('#fs-save').addEventListener('click', () => {
+    const newSettings = {};
+    editable.forEach(([key]) => {
+      const val = Number($('#fs-' + key).value);
+      newSettings[key] = isNaN(val) ? OUTREACH_STATUS[key].defaultDays : val;
+    });
+    newSettings._aiKey = $('#fs-aikey').value.trim();
+    newSettings._aiEndpoint = $('#fs-aiendpoint').value.trim() || 'https://api.openai.com/v1';
+    newSettings._aiModel = $('#fs-aimodel').value.trim() || 'gpt-4o-mini';
+    saveOutreachSettings(newSettings);
+    toast('设置已保存', 'success');
+    close();
+    render();
+  });
+}
+
+/* ---------- message generation ---------- */
+function openMessageGen(lead) {
+  const msg = outreachMsg(lead);
+  const origEn = msg.en;
+  const origZh = msg.zh;
+  const showZh = true; // Anna's preference: always show Chinese reference
+  let currentLang = 'en';
+  const html = `
+    <h3 style="font-size:16px;font-weight:700;margin-bottom:4px">消息生成 · ${esc(lead.nickname || '—')}</h3>
+    <p style="font-size:12px;color:#888;margin-bottom:14px">${esc(OUTREACH_STATUS[lead.status]?.label || '')} → ${esc(OUTREACH_STATUS[lead.status]?.nextAction || '')}</p>
+    <div class="msg-tabs">
+      <div class="msg-tab active" data-lang="en">English (发给客户)</div>
+      <div class="msg-tab" data-lang="zh" ${!showZh ? 'style="display:none"' : ''}>中文参考</div>
+    </div>
+    <div class="msg-card" id="msg-en">
+      <h4>📋 English Message <small style="font-weight:400;color:#888;font-size:12px">——可直接编辑</small></h4>
+      <textarea id="mt-en">${esc(msg.en)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="msg-copy-btn" data-copy="en">📋 复制英文</button>
+        <button class="o-act-btn" id="msg-reset-en" style="padding:8px 14px;font-size:13px">🔄 重置为模板</button>
+      </div>
+    </div>
+    <div class="msg-card" id="msg-zh" style="display:none">
+      <h4>📋 中文参考 <small style="font-weight:400;color:#888;font-size:12px">——可直接编辑</small></h4>
+      <textarea id="mt-zh">${esc(msg.zh)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="msg-copy-btn" data-copy="zh">📋 复制中文</button>
+        <button class="o-act-btn" id="msg-reset-zh" style="padding:8px 14px;font-size:13px">🔄 重置为模板</button>
+      </div>
+    </div>
+    ${lead.email ? `<p style="font-size:13px;color:#666">📧 发送到: <a href="mailto:${esc(lead.email)}" class="o-link">${esc(lead.email)}</a></p>` : ''}
+    <div style="display:flex;gap:10px;margin-top:14px">
+      <button class="o-act-btn primary" style="flex:1;padding:10px" id="msg-sent">✅ 已发送，状态流转</button>
+      <button class="o-act-btn" style="padding:10px" id="msg-close">关闭</button>
+    </div>
+  `;
+  const { close } = openModal(html, { wide: true });
+  $('#msg-close').addEventListener('click', close);
+
+  // tab switching
+  $$('.msg-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      $$('.msg-tab').forEach((t) => t.classList.remove('active'));
+      tab.classList.add('active');
+      currentLang = tab.dataset.lang;
+      $('#msg-en').style.display = currentLang === 'en' ? '' : 'none';
+      $('#msg-zh').style.display = currentLang === 'zh' ? '' : 'none';
+    });
+  });
+
+  // copy buttons
+  $$('.msg-copy-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const lang = btn.dataset.copy;
+      const text = $('#mt-' + lang).value;
+      navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.textContent;
+        btn.textContent = '✅ 已复制';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
+      }).catch(() => {
+        // fallback
+        const ta = $('#mt-' + lang);
+        ta.select();
+        document.execCommand('copy');
+        toast('已复制', 'success');
+      });
+    });
+  });
+
+  // reset buttons
+  $('#msg-reset-en').addEventListener('click', () => { $('#mt-en').value = origEn; toast('已重置英文模板', 'success'); });
+  $('#msg-reset-zh').addEventListener('click', () => { $('#mt-zh').value = origZh; toast('已重置中文模板', 'success'); });
+
+  // mark sent → transition
+  $('#msg-sent').addEventListener('click', async () => {
+    close();
+    // auto-transition based on current status
+    const transitions = OUTREACH_TRANSITIONS[lead.status] || [];
+    if (transitions.length === 1) {
+      await transitionLead(lead.id, transitions[0].to);
+    } else if (transitions.length > 1) {
+      // multiple options — just close, user picks from table
+      toast('请从表格选择下一步状态', 'info');
+    } else {
+      toast('当前状态为终止态', 'info');
+    }
+  });
+}
+
+/* ---------- state transition + comm log ---------- */
+async function transitionLead(id, newStatus) {
+  const lead = await getOne('leads', id);
+  if (!lead) { toast('记录不存在', 'error'); return; }
+  const oldStatus = lead.status;
+  if (oldStatus === newStatus) return;
+  const cfg = OUTREACH_STATUS[newStatus];
+  if (!cfg) { toast('未知状态: ' + newStatus, 'error'); return; }
+  const now = new Date().toISOString();
+  lead.status = newStatus;
+  lead.lastActionDate = now;
+  lead.updatedAt = now;
+  if (!lead.commLog) lead.commLog = [];
+  lead.commLog.push({
+    ts: now,
+    date: now.slice(0, 10),
+    action: `状态: ${OUTREACH_STATUS[oldStatus]?.label || oldStatus} → ${cfg.label}`,
+    detail: cfg.nextAction ? `下一步: ${cfg.nextAction}` : '终止',
+  });
+  await putOne('leads', lead);
+  toast(`已流转至「${cfg.label}」${cfg.nextAction ? '，下一步: ' + cfg.nextAction : ''}`, 'success');
+  render();
+}
+
+/* ---------- delete ---------- */
+async function deleteLead(id) {
+  const lead = await getOne('leads', id);
+  if (!lead) return;
+  const html = `
+    <h3 style="font-size:16px;font-weight:700;margin-bottom:12px">确认删除</h3>
+    <p style="font-size:14px;color:#666;margin-bottom:16px">删除后无法恢复。确认删除红人 <strong>${esc(lead.nickname)}</strong> (${esc(OUTREACH_STATUS[lead.status]?.label || '')})？</p>
+    <div style="display:flex;gap:10px">
+      <button class="o-act-btn danger" style="flex:1;padding:10px" id="dl-confirm">删除</button>
+      <button class="o-act-btn" style="flex:1;padding:10px" class="x-btn">取消</button>
+    </div>
+  `;
+  const { close } = openModal(html);
+  $('#dl-confirm').addEventListener('click', async () => {
+    await delOne('leads', id);
+    toast('已删除', 'success');
+    close();
+    render();
+  });
+}
+
+/* ============================================================
    INIT
    ============================================================ */
 async function init() {
+  // 动态显示真实运行版本（破解“写死徽标”造成的缓存误判）
+  const badge = $('#app-version-badge');
+  if (badge) badge.textContent = APP_VERSION;
+  console.log('[工作台] 当前运行 app.js 版本：', APP_VERSION);
   $$('.nav-item').forEach((b) => b.addEventListener('click', () => navigate(b.dataset.view)));
   $('#btn-back').addEventListener('click', (e) => { e.stopPropagation(); closeTopFloat(); });
   $('#btn-close-all').addEventListener('click', (e) => { e.stopPropagation(); closeAllFloats(); });
+  bindCloudButton();
   bindInfiniteScroll();
   // 点击页面任意空白区域：关闭所有下拉/菜单/侧边浮窗
   document.addEventListener('click', (e) => {
@@ -3740,6 +5498,78 @@ async function init() {
   ensureDefaultDropdownCfg();
   migrateComments();
   navigate('dashboard');
+  // 云端模式：若之前已登录则自动恢复会话并拉取/订阅
+  initCloudOnLoad().then(() => { if (typeof render === 'function') render(); }).catch((e) => console.warn('[cloud] 初始化失败', e));
 }
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-else init();
+/* ============================================================
+   访问口令门（仅指定的人能打开网站）
+   口令以 SHA-256 哈希存储于 ACCESS_HASH，源码不含明文口令。
+   配合私有仓库使用：源码不公开 → 哈希不可见 → 安全。
+   ============================================================ */
+const ACCESS_HASH = 'ef5860dead978df958178b2e84b4f5e871fb302751bc2811dc9070fda977e5ff';
+const ACCESS_HINT = '请输入团队访问口令（仅授权人员可进入）';
+
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+function injectGateStyles() {
+  if (document.getElementById('access-gate-style')) return;
+  const s = document.createElement('style');
+  s.id = 'access-gate-style';
+  s.textContent = `
+  .access-gate{position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0f172a,#1e293b);font-family:system-ui,-apple-system,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif}
+  .access-card{background:#fff;border-radius:14px;padding:32px 28px;width:340px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.35);text-align:center}
+  .access-card h2{margin:0 0 6px;font-size:20px;color:#0f172a}
+  .access-card .sub{color:#64748b;font-size:13px;margin:0 0 18px}
+  .access-card input{width:100%;box-sizing:border-box;padding:11px 12px;font-size:15px;border:1px solid #d1d5db;border-radius:9px;margin-bottom:12px;outline:none}
+  .access-card input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .access-card .btn{width:100%}
+  .access-err{color:#dc2626;font-size:13px;margin:10px 0 0;min-height:18px}
+  `;
+  document.head.appendChild(s);
+}
+function buildGate() {
+  injectGateStyles();
+  const gate = document.createElement('div');
+  gate.id = 'access-gate';
+  gate.className = 'access-gate';
+  gate.innerHTML = `
+    <div class="access-card">
+      <h2>🔒 受限访问</h2>
+      <p class="sub">${ACCESS_HINT}</p>
+      <input type="password" id="access-pwd" placeholder="请输入访问口令" autocomplete="off">
+      <button class="btn btn-primary" id="access-btn">进入工作台</button>
+      <p class="access-err" id="access-err"></p>
+    </div>`;
+  document.body.appendChild(gate);
+  const pwd = gate.querySelector('#access-pwd');
+  const btn = gate.querySelector('#access-btn');
+  const err = gate.querySelector('#access-err');
+  const tryOpen = async () => {
+    const v = pwd.value;
+    if (!v) { err.textContent = '请输入口令'; return; }
+    if (!crypto.subtle) { err.textContent = '当前环境不支持安全校验，请通过 https 访问'; return; }
+    const h = await sha256Hex(v);
+    if (h === ACCESS_HASH) {
+      try { sessionStorage.setItem('app_access_ok', '1'); } catch (e) {}
+      gate.remove();
+      runApp();
+    } else {
+      err.textContent = '口令错误，请重试';
+      pwd.value = ''; pwd.focus();
+    }
+  };
+  btn.addEventListener('click', tryOpen);
+  pwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryOpen(); });
+  setTimeout(() => pwd.focus(), 50);
+}
+function runApp() {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+}
+(function boot() {
+  try { if (sessionStorage.getItem('app_access_ok') === '1') { runApp(); return; } } catch (e) {}
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', buildGate);
+  else buildGate();
+})();

@@ -1,6 +1,6 @@
 // Service Worker — app shell offline cache for PWA
 // offline-first: navigation -> cached app shell; static assets -> cache-first (stale-while-revalidate)
-const CACHE = 'review-admin-v20';
+const CACHE = 'review-admin-v27';
 const SHELL = [
   './',
   'index.html',
@@ -47,6 +47,10 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+self.addEventListener('message', (e) => {
+  if (e.data === 'skipWaiting') self.skipWaiting();
+});
+
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
@@ -59,7 +63,25 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // Static assets: cache-first (stale-while-revalidate)
+  // Critical app code (app.js / styles.css): NETWORK-FIRST so a fresh deploy
+  // is always picked up online (no more stale cached logic). Falls back to cache offline.
+  const url = new URL(req.url);
+  if (/\/(app\.js|styles\.css)(\?|$)/.test(url.pathname)) {
+    e.respondWith(
+      fetch(req)
+        .then((res) => {
+          if (res && res.status === 200) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.match(req))
+    );
+    return;
+  }
+
+  // Other static assets: cache-first (stale-while-revalidate)
   e.respondWith(
     caches.match(req).then((cached) => {
       const network = fetch(req)

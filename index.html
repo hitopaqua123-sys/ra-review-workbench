@@ -20,7 +20,9 @@
   <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2)" href="splash-828x1792.png" />
   <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2)" href="splash-750x1334.png" />
   <link rel="stylesheet" href="vendor/fonts/fonts.css" />
-  <link rel="stylesheet" href="styles.css?v=20260813d" />
+  <link rel="stylesheet" href="styles.css?v=20260814a" />
+  <!-- Force horizontal scroll - overrides any cached old CSS -->
+  <style>.content{overflow-y:auto!important;overflow-x:hidden!important}.table-wrap{overflow-x:auto!important;overflow-y:visible!important;display:block!important}table.data{width:100%!important;min-width:max-content!important}</style>
 </head>
 <body>
   <div id="app">
@@ -43,6 +45,9 @@
         <button class="nav-item" data-view="orders">
           <span class="nav-ico">▤</span><span>订单管理</span>
         </button>
+        <button class="nav-item" data-view="outreach">
+          <span class="nav-ico">📣</span><span>红人跟进</span>
+        </button>
         <button class="nav-item" data-view="comments">
           <span class="nav-ico">💬</span><span>客户评论管理</span>
         </button>
@@ -52,6 +57,8 @@
       </nav>
       <div class="sidebar-foot">
         <span class="tiny muted" style="padding:6px 8px">数据保存在本机浏览器</span>
+        <span class="tiny muted" id="cloud-status" style="padding:6px 8px;display:block">💾 本地模式（仅本机）</span>
+        <span class="tiny muted" style="padding:6px 8px;display:block">运行版本 <b id="app-version-badge">…</b></span>
       </div>
     </aside>
 
@@ -64,6 +71,7 @@
         </div>
         <div class="topbar-title" id="view-title">数据仪表盘</div>
         <div class="topbar-actions">
+          <button class="btn btn-sm" id="btn-cloud" title="云端账号 / 模式切换">💾 本地模式</button>
           <span class="env-tag">本地版 · 数据存于本机浏览器</span>
           <div class="topbar-pill">
             <div class="topbar-ico" title="通知">🔔</div>
@@ -81,15 +89,23 @@
   <div id="float-root"></div>
   <div id="toast-root"></div>
 
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="vendor/chart.umd.min.js"></script>
   <script src="vendor/xlsx.full.min.js"></script>
   <script src="vendor/fflate.umd.min.js"></script>
   <script src="seed_data.js?v=20260812a"></script>
-  <script src="app.js?v=20260813a"></script>
+  <script src="app.js?v=20260821e"></script>
   <script>
     if ('serviceWorker' in navigator) {
+      // Auto-reload when a new service worker takes control (after a deploy)
+      let reloading = false;
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        if (!reloading) { reloading = true; location.reload(); }
+      });
       window.addEventListener('load', function () {
-        navigator.serviceWorker.register('sw.js').catch(function (err) {
+        navigator.serviceWorker.register('sw.js').then(function (reg) {
+          if (reg.waiting) { reg.waiting.postMessage('skipWaiting'); }
+        }).catch(function (err) {
           console.warn('SW register failed:', err);
         });
       });
