@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260821d';
+const APP_VERSION = '20260821e';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -2511,6 +2511,7 @@ async function renderOrders(c, keepScroll = false) {
       <button class="btn btn-sm" id="o-excel-in">⭱ 导入Excel</button>
       <button class="btn btn-sm btn-danger" id="o-batch">🗑 批量删除 (<span id="o-batch-n">0</span>)</button>
       <button class="btn btn-sm" id="o-cols" title="列设置（显示/隐藏/下拉配置）">⚙ 列设置</button>
+      <button class="btn btn-sm" id="o-ai">🤖 AI录入</button>
       <button class="btn btn-primary btn-sm" id="o-add">+ 新增订单</button>
     </div>
     ${filterTagsHtml('orders')}
@@ -2577,6 +2578,7 @@ async function renderOrders(c, keepScroll = false) {
   const sortTh = $('#o-sort-th');
   if (sortTh) sortTh.addEventListener('click', toggleSort);
   $('#o-add').addEventListener('click', () => openOrderForm(null));
+  const oAi = $('#o-ai'); if (oAi) oAi.addEventListener('click', () => openAIExtractModal('order'));
   $('#o-cols').addEventListener('click', () => openColumnSettings('orders', () => renderOrders(c, true)));
   $('#o-comment-stat').addEventListener('click', () => openCommentMonthChart(list));
   $$('.comment-expand', c).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); const id = b.dataset.cid; if (state.orders._expanded.has(id)) state.orders._expanded.delete(id); else state.orders._expanded.add(id); renderOrders(c, true); }));
@@ -2691,7 +2693,8 @@ async function openOrderForm(id, prefill = null) {
       if (dbOrder) v = dbOrder;
     }
   } else if (prefill) {
-    v = prefill.orderNumber != null ? buildOrderPrefillFromOrder(prefill) : buildOrderPrefillFromCustomer(prefill);
+    if (prefill.__raw) v = prefill;
+    else v = prefill.orderNumber != null ? buildOrderPrefillFromOrder(prefill) : buildOrderPrefillFromCustomer(prefill);
   }
   const allOrders = await getAll('orders');
   const storeOptions = [...new Set([...allOrders.map((x) => x.store), 'HS-US', 'HS-UK', 'HS-DE', 'HS-AU', 'HS-CA', 'HS-FR', 'IB-US', 'IB-UK', 'IB-DE', 'IB-AU', 'IB-CA', 'IB-FR'].filter(Boolean))].sort();
@@ -4610,6 +4613,8 @@ function getOutreachSettings() {
     defaults[k] = v.defaultDays;
   });
   defaults._aiKey = '';
+  defaults._aiEndpoint = 'https://api.openai.com/v1';
+  defaults._aiModel = 'gpt-4o-mini';
   return defaults;
 }
 function saveOutreachSettings(s) {
@@ -4797,10 +4802,20 @@ async function renderOutreach(c, keepScroll) {
     .o-settings-row label { width:130px; font-size:13px; font-weight:600; }
     .o-settings-row input { width:60px; padding:6px 8px; border:1px solid #ddd; border-radius:6px; text-align:center; }
     .o-settings-row .hint { font-size:12px; color:#999; }
+    .ai-tip { font-size:12.5px; color:#555; line-height:1.6; background:#f6f8fa; border-radius:10px; padding:10px 12px; margin-bottom:12px; }
+    .ai-input { width:100%; min-height:120px; padding:10px 12px; border:1px solid #ddd; border-radius:10px; font-size:13.5px; line-height:1.6; resize:vertical; font-family:inherit; }
+    .ai-status { font-size:12.5px; color:#2563eb; margin-left:6px; }
+    .ai-summary { background:#eef6ff; border:1px solid #cfe3ff; border-left:4px solid #2563eb; border-radius:10px; padding:10px 12px; font-size:13px; color:#0f3d6e; line-height:1.6; margin-bottom:12px; white-space:pre-wrap; }
+    .ai-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 14px; }
+    .ai-cell { display:flex; flex-direction:column; gap:4px; }
+    .ai-cell label { font-size:12px; font-weight:600; color:#444; }
+    .ai-cell input, .ai-cell select, .ai-cell textarea { padding:8px 10px; border:1px solid #ddd; border-radius:8px; font-size:13.5px; font-family:inherit; }
+    .ai-cell textarea { min-height:54px; resize:vertical; grid-column:1/-1; }
   </style>
   <div class="o-toolbar">
     <button class="o-act-btn primary" data-o-act="new">+ 新发现</button>
     <button class="o-act-btn" data-o-act="settings">⚙ 跟进设置</button>
+    <button class="o-act-btn" id="o-ai-lead">🤖 AI录入</button>
     <input class="o-search" type="text" placeholder="搜索昵称/平台/国家/产品/邮箱/备注…" value="${esc(state.outreach.kw || '')}" data-o-input="search">
     <select data-o-input="status">
       <option value="">全部状态</option>
@@ -4892,6 +4907,8 @@ async function renderOutreach(c, keepScroll) {
       renderOutreach(c, true);
     });
   }
+  const oAiLead = $('#o-ai-lead', c);
+  if (oAiLead) oAiLead.addEventListener('click', () => openAIExtractModal('lead'));
   // button delegations
   $$('[data-o-act]', c).forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -4935,8 +4952,8 @@ function platformIcon(platform) {
 }
 
 /* ---------- new / edit form ---------- */
-function openLeadForm(lead) {
-  const isEdit = !!lead;
+function openLeadForm(lead, opts = {}) {
+  const isEdit = !!lead && !opts.prefill;
   const l = lead || { platform: 'TikTok', nickname: '', profileUrl: '', country: '', product: '', email: '', notes: '', reminderDays: '' };
   const platforms = ['TikTok', 'Instagram', 'YouTube', 'Facebook', 'Twitter/X', 'Pinterest', 'Reddit', 'Blog', 'Other'];
   const statusKeys = Object.keys(OUTREACH_STATUS);
@@ -5040,7 +5057,7 @@ function openLeadForm(lead) {
       toast('已保存', 'success');
     } else {
       data.id = uid();
-      data.status = 'pending';
+      data.status = (lead && OUTREACH_STATUS[lead.status]) ? lead.status : 'pending';
       const now = new Date().toISOString();
       data.lastActionDate = now;
       data.createdAt = now;
@@ -5051,6 +5068,205 @@ function openLeadForm(lead) {
     }
     close();
     render();
+  });
+}
+
+/* ---------- 🤖 AI 录入（粘贴聊天→提取→填表）---------- */
+
+// 本地正则兜底提取：无 AI Key 时也能抓出明显字段
+function localExtract(text, kind) {
+  const t = text || '';
+  const out = {};
+  // 邮箱（订单字段名 = customerEmail，红人字段名 = email）
+  const email = (t.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || [])[0] || '';
+  if (email) { if (kind === 'order') out.customerEmail = email; else out.email = email; }
+  // 链接（订单字段名 = socialMediaUrl，红人字段名 = profileUrl）
+  const url = (t.match(/https?:\/\/[^\s)'"]+/gi) || [])[0] || '';
+  if (url) { if (kind === 'order') out.socialMediaUrl = url; else out.profileUrl = url; }
+  // 平台识别
+  const lower = t.toLowerCase();
+  let platform = '';
+  if (/tiktok/.test(lower)) platform = 'TikTok';
+  else if (/instagram|ig\b/.test(lower)) platform = 'Instagram';
+  else if (/youtube/.test(lower)) platform = 'YouTube';
+  else if (/facebook|fb\b/.test(lower)) platform = 'Facebook';
+  else if (/twitter|x\.com/.test(lower)) platform = 'Twitter/X';
+  else if (/pinterest/.test(lower)) platform = 'Pinterest';
+  else if (/reddit/.test(lower)) platform = 'Reddit';
+  else if (/blog/.test(lower)) platform = 'Blog';
+  if (platform) out.platform = platform;
+  // 金额 + 货币
+  const curMap = [['¥', 'CNY'], ['￥', 'CNY'], ['RMB', 'CNY'], ['CNY', 'CNY'], ['€', 'EUR'], ['EUR', 'EUR'], ['£', 'GBP'], ['GBP', 'GBP'], ['\\$', 'USD'], ['USD', 'USD']];
+  let cur = '', amt = '';
+  for (const [sym, code] of curMap) {
+    const m = t.match(new RegExp(sym + '\\s?(\\d+(?:[.,]\\d{1,2})?)'));
+    if (m) { cur = code; amt = m[1].replace(',', '.'); break; }
+  }
+  if (!amt) { const m = t.match(/(?:^|\s)(\d+(?:[.,]\d{1,2})?)\s*(?:usd|eur|gbp|cny|rmb|美元|欧|镑)/i); if (m) { amt = m[1].replace(',', '.'); cur = (m[2] || '').toUpperCase() || 'USD'; } }
+  if (amt) { out.amount = amt; out.currency = cur || 'USD'; }
+  // 订单号
+  const onum = (t.match(/#\s?([A-Za-z0-9][\w-]{4,})/)) || (t.match(/(?:订单号|order\s*(?:#|no)?\.?\s*[:：]?\s*)([A-Za-z0-9][\w-]{4,})/i)) || (t.match(/\b(\d{6,})\b/));
+  if (onum) out.orderNumber = onum[1];
+  // 店铺
+  const store = t.match(/\b((?:HS|IB)[-\s]?(?:US|UK|DE|AU|CA|FR|IT|ES))\b/i);
+  if (store) out.store = store[1].toUpperCase().replace(/\s/, '-');
+  // 国家
+  const ctry = t.match(/\b(US|USA|United States|DE|Germany|UK|United Kingdom|GB|AU|Australia|CA|Canada|FR|France|IT|Italy|ES|Spain|JP|Japan)\b/i);
+  if (ctry) {
+    const map = { usa: 'US', 'united states': 'US', uk: 'UK', 'united kingdom': 'UK', gb: 'UK', de: 'DE', germany: 'DE', au: 'AU', australia: 'AU', ca: 'CA', canada: 'CA', fr: 'FR', france: 'FR', it: 'IT', italy: 'IT', es: 'ES', spain: 'ES', jp: 'JP', japan: 'JP' };
+    out.country = map[ctry[1].toLowerCase()] || ctry[1].toUpperCase();
+  }
+  // 返款方式
+  if (/paypal/i.test(t)) { out.refundMethod = 'PayPal'; if (email) out.ppAccount = email; }
+  else if (/银行|bank/i.test(t)) out.refundMethod = '银行转账';
+  else if (/平台退款|refund/i.test(t)) out.refundMethod = '平台退款';
+  // 客户名 / 昵称
+  const nameM = t.match(/(?:客户|customer|name|姓名|昵称)[\s：:]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|$)/i);
+  if (nameM) { const nm = nameM[1].trim(); if (kind === 'lead') out.nickname = nm; else out.customerName = nm; }
+  else if (kind === 'lead') { const at = t.match(/@([\w.]{3,30})/); if (at) out.nickname = at[1]; }
+  // 产品
+  const prodM = t.match(/(?:产品|product|买了|purchase)[\s：:]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{1,30}?)(?:\n|$|\.)/i);
+  if (prodM) out.product = prodM[1].trim();
+  // 状态默认值
+  out.status = kind === 'lead' ? 'pending' : 'pending_refund';
+  // 关键信息摘要
+  const found = [];
+  if (out.orderNumber) found.push('订单号 ' + out.orderNumber);
+  if (out.customerName || out.nickname) found.push('姓名 ' + (out.customerName || out.nickname));
+  if (out.email || out.customerEmail) found.push('邮箱 ' + (out.email || out.customerEmail));
+  if (out.amount) found.push('金额 ' + out.currency + ' ' + out.amount);
+  if (out.country) found.push('国家 ' + out.country);
+  if (out.store) found.push('店铺 ' + out.store);
+  if (out.platform) found.push('平台 ' + out.platform);
+  let summary = found.length ? ('已识别：' + found.join('；') + '。') : '未识别到明显字段。';
+  summary += ' 其余字段请手动补充后保存。';
+  return { fields: out, summary, source: 'local' };
+}
+
+// 调用 AI 提取（OpenAI 兼容）；失败或无 Key 时回退本地提取
+async function callAIExtract(text, kind) {
+  const s = getOutreachSettings();
+  const key = (s._aiKey || '').trim();
+  if (!key) return { ...localExtract(text, kind), source: 'local' };
+  const endpoint = (s._aiEndpoint || 'https://api.openai.com/v1').replace(/\/$/, '');
+  const model = (s._aiModel || 'gpt-4o-mini').trim();
+  const fieldList = kind === 'order'
+    ? ['orderNumber', 'customerName', 'customerEmail', 'store', 'product', 'amount', 'currency', 'country', 'socialMediaUrl', 'refundMethod', 'ppAccount', 'status', 'reviewContent']
+    : ['platform', 'nickname', 'profileUrl', 'country', 'product', 'email', 'status'];
+  const sys = `You are a data extraction assistant for an aquarium influencer/order management system. The user pastes a chat with a customer or influencer. Extract structured fields and return ONLY valid JSON: {"fields":{...},"summary":"key points in Chinese"}.
+Field names when present: ${fieldList.join(', ')}.
+- Missing fields => empty string "".
+- order "status": one of pending_refund, transferred, reviewing, completed, abandoned.
+- lead "status": one of pending, contacted, confirmed, guiding, paid, review_requested, review_retry, reviewed, abandoned.
+- "amount": number as string. "currency": USD/EUR/GBP/CNY.
+- "summary": 2-3 short Chinese sentences on what matters (e.g. 客户已收货等待索评 / 对退款方式有疑问 / 红人为TikTok新发现).`;
+  try {
+    const resp = await fetch(`${endpoint}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+      body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, { role: 'user', content: text }], temperature: 0.2, response_format: { type: 'json_object' } }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '{}';
+    const parsed = JSON.parse(content);
+    const fields = parsed.fields || {};
+    if (kind === 'lead' && fields.profileUrl == null && fields.socialMediaUrl != null) fields.profileUrl = fields.socialMediaUrl;
+    if (kind === 'order' && fields.socialMediaUrl == null && fields.profileUrl != null) fields.socialMediaUrl = fields.profileUrl;
+    return { fields, summary: parsed.summary || '', source: 'ai' };
+  } catch (e) {
+    console.warn('AI 提取失败，回退本地规则：', e);
+    return { ...localExtract(text, kind), source: 'local', aiError: true };
+  }
+}
+
+// AI 录入弹窗
+function openAIExtractModal(kind) {
+  const isOrder = kind === 'order';
+  const title = isOrder ? '🤖 AI 录入 · 订单' : '🤖 AI 录入 · 红人';
+  const defs = isOrder
+    ? [['orderNumber', '订单号'], ['customerName', '客户名称'], ['customerEmail', '客户邮箱'], ['store', '店铺'], ['product', '产品'], ['amount', '金额'], ['currency', '货币'], ['country', '国家'], ['socialMediaUrl', '社媒链接'], ['refundMethod', '返款方式'], ['ppAccount', 'PayPal'], ['reviewContent', '测评文案']]
+    : [['platform', '平台'], ['nickname', '昵称'], ['profileUrl', '主页链接'], ['country', '国家'], ['product', '产品'], ['email', '邮箱']];
+  const statusOpts = isOrder
+    ? Object.entries(STATUS).map(([k, m]) => `<option value="${k}">${esc(m.label)}</option>`).join('')
+    : Object.keys(OUTREACH_STATUS).map((k) => `<option value="${k}">${esc(OUTREACH_STATUS[k].label)}</option>`).join('');
+  let html = `
+    <div class="modal-head"><h3>${title}</h3><button class="x-btn modal-close">×</button></div>
+    <div class="modal-body">
+      <p class="ai-tip">粘贴你与客户的聊天记录（微信 / 邮件 / 社媒私信均可），点「分析提取」自动识别关键信息并填入下方。无 AI 密钥时用本地规则提取明显字段，其余请手动补充。</p>
+      <textarea id="ai-input" class="ai-input" placeholder="在此粘贴聊天记录…"></textarea>
+      <div style="margin-top:10px"><button class="o-act-btn primary" id="ai-run">🔍 分析提取</button> <span id="ai-status" class="ai-status"></span></div>
+      <div id="ai-result" style="display:none;margin-top:14px">
+        <div class="ai-summary" id="ai-summary"></div>
+        <div class="ai-grid" id="ai-grid"></div>
+        <div style="display:flex;gap:10px;margin-top:14px">
+          <button class="o-act-btn primary" id="ai-save">${isOrder ? '💾 保存为订单' : '💾 保存为红人'}</button>
+          <button class="o-act-btn" id="ai-rerun">重新分析</button>
+          <button class="o-act-btn" id="ai-cancel">取消</button>
+        </div>
+      </div>
+    </div>`;
+  const { close } = openModal(html, { wide: true });
+  const input = $('#ai-input');
+  const resultBox = $('#ai-result');
+  const statusEl = $('#ai-status');
+  let lastFields = {};
+
+  const renderGrid = (fields) => {
+    lastFields = fields || {};
+    const grid = $('#ai-grid');
+    grid.innerHTML = defs.map(([k, label]) => {
+      const val = lastFields[k] != null ? lastFields[k] : '';
+      const isStatus = k === 'status';
+      const isArea = k === 'reviewContent';
+      const id = isStatus ? 'ai-status-sel' : 'ai-' + k;
+      const control = isStatus
+        ? `<select id="${id}">${statusOpts}</select>`
+        : isArea
+          ? `<textarea id="${id}" placeholder="${label}">${esc(val)}</textarea>`
+          : `<input id="${id}" value="${esc(val)}" placeholder="${label}">`;
+      return `<div class="ai-cell"><label>${esc(label)}</label>${control}</div>`;
+    }).join('');
+    const st = $('#ai-status-sel'); if (st && lastFields.status) st.value = lastFields.status;
+    resultBox.style.display = 'block';
+  };
+
+  const run = async () => {
+    const txt = input.value.trim();
+    if (!txt) { toast('请先粘贴聊天记录', 'error'); return; }
+    statusEl.textContent = '分析中…';
+    const r = await callAIExtract(txt, kind);
+    statusEl.textContent = r.source === 'ai' ? '✅ AI 提取完成' : (r.aiError ? '⚠️ AI 失败，已用本地规则' : '✅ 本地规则提取');
+    $('#ai-summary').textContent = r.summary || '';
+    renderGrid(r.fields);
+  };
+
+  $('#ai-run').addEventListener('click', run);
+  $('#ai-rerun').addEventListener('click', run);
+  $('#ai-cancel').addEventListener('click', close);
+
+  $('#ai-save').addEventListener('click', () => {
+    const f = {};
+    defs.forEach(([k]) => {
+      const id = k === 'status' ? 'ai-status-sel' : 'ai-' + k;
+      const el = $('#' + id); if (el) f[k] = el.value.trim();
+    });
+    if (isOrder) {
+      const prefill = {
+        __raw: true,
+        orderNumber: f.orderNumber, customerName: f.customerName, customerEmail: f.customerEmail,
+        store: f.store, product: f.product, amount: f.amount ? Number(f.amount) : 0, currency: f.currency,
+        country: f.country, socialMediaUrl: f.socialMediaUrl, refundMethod: f.refundMethod,
+        ppAccount: f.ppAccount, reviewContent: f.reviewContent, status: f.status || 'pending_refund',
+        orderDate: todayISO(),
+      };
+      close();
+      openOrderForm(null, prefill);
+    } else {
+      const prefill = { platform: f.platform || 'TikTok', nickname: f.nickname, profileUrl: f.profileUrl, country: f.country, product: f.product, email: f.email, status: f.status || 'pending' };
+      close();
+      openLeadForm(prefill, { prefill: true });
+    }
   });
 }
 
@@ -5079,9 +5295,19 @@ function openFollowSettings() {
     <div style="font-size:12px;color:#94a3b8;margin:6px 0 0 106px">0 = 每天提醒（如「待开发」需立刻私信）；留空则沿用上方数值</div>
     <hr style="margin:16px 0;border:none;border-top:1px solid #eee">
     <div class="o-settings-row">
-      <label style="width:96px">AI 重写密钥</label>
-      <input type="password" id="fs-aikey" value="${esc(settings._aiKey || '')}" placeholder="留空=关闭 AI 重写" style="width:280px;text-align:left">
-      <span class="hint">可选（OpenAI/兼容 API Key）</span>
+      <label style="width:96px">AI 接口地址</label>
+      <input type="text" id="fs-aiendpoint" value="${esc(settings._aiEndpoint || 'https://api.openai.com/v1')}" placeholder="https://api.openai.com/v1" style="width:280px;text-align:left">
+      <span class="hint">OpenAI 或兼容接口</span>
+    </div>
+    <div class="o-settings-row">
+      <label style="width:96px">AI 模型</label>
+      <input type="text" id="fs-aimodel" value="${esc(settings._aiModel || 'gpt-4o-mini')}" placeholder="gpt-4o-mini" style="width:200px;text-align:left">
+      <span class="hint">如 gpt-4o-mini</span>
+    </div>
+    <div class="o-settings-row">
+      <label style="width:96px">AI 密钥</label>
+      <input type="password" id="fs-aikey" value="${esc(settings._aiKey || '')}" placeholder="留空=仅用本地提取" style="width:280px;text-align:left">
+      <span class="hint">可选（用于「🤖 AI录入」与话术重写）</span>
     </div>
     <div style="display:flex;gap:10px;margin-top:20px">
       <button class="o-act-btn primary" style="flex:1;padding:10px" id="fs-save">保存设置</button>
@@ -5097,6 +5323,8 @@ function openFollowSettings() {
       newSettings[key] = isNaN(val) ? OUTREACH_STATUS[key].defaultDays : val;
     });
     newSettings._aiKey = $('#fs-aikey').value.trim();
+    newSettings._aiEndpoint = $('#fs-aiendpoint').value.trim() || 'https://api.openai.com/v1';
+    newSettings._aiModel = $('#fs-aimodel').value.trim() || 'gpt-4o-mini';
     saveOutreachSettings(newSettings);
     toast('设置已保存', 'success');
     close();
