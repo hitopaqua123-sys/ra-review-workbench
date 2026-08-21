@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260821e';
+const APP_VERSION = '20260821f';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -4615,6 +4615,7 @@ function getOutreachSettings() {
   defaults._aiKey = '';
   defaults._aiEndpoint = 'https://api.openai.com/v1';
   defaults._aiModel = 'gpt-4o-mini';
+  defaults._selfEmails = 'anna@ibayaqua.com';  // 操作员自己的邮箱，提取时自动排除
   return defaults;
 }
 function saveOutreachSettings(s) {
@@ -5077,25 +5078,46 @@ function openLeadForm(lead, opts = {}) {
 function localExtract(text, kind) {
   const t = text || '';
   const out = {};
-  // 邮箱（订单字段名 = customerEmail，红人字段名 = email）
-  const email = (t.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || [])[0] || '';
-  if (email) { if (kind === 'order') out.customerEmail = email; else out.email = email; }
-  // 链接（订单字段名 = socialMediaUrl，红人字段名 = profileUrl）
-  const url = (t.match(/https?:\/\/[^\s)'"]+/gi) || [])[0] || '';
-  if (url) { if (kind === 'order') out.socialMediaUrl = url; else out.profileUrl = url; }
-  // 平台识别
+  const s = getOutreachSettings();
+  // 操作员自邮列表（提取客户邮箱时自动跳过）
+  const selfEmails = (s._selfEmails || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+  const isSelfEmail = (addr) => selfEmails.includes(addr.toLowerCase());
+
+  // ═══ 邮箱（排除操作员自己的邮箱）═══
+  const allEmails = (t.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || []);
+  // 过滤掉自邮，取第一个非自邮的作为客户邮箱
+  const customerEmail = allEmails.find(e => !isSelfEmail(e)) || '';
+  if (customerEmail) {
+    if (kind === 'order') out.customerEmail = customerEmail;
+    else out.email = customerEmail;
+  }
+
+  // ═══ URL 分类（区分电商链接 vs 社媒主页）═══
+  const ECOM_DOMAINS = ['amazon', 'amzn', 'ebay', 'aliexpress', 'temu', 'shein', 'walmart', 'target', 'bestbuy'];
+  const allUrls = (t.match(/https?:\/\/[^\s)'"]+/gi) || []);
+  // 找第一个非电商URL作为社媒/主页链接
+  const socialUrl = allUrls.find(u => !ECOM_DOMAINS.some(d => u.toLowerCase().includes(d))) || '';
+  if (socialUrl) {
+    if (kind === 'order') out.socialMediaUrl = socialUrl;
+    else out.profileUrl = socialUrl;
+  }
+
+  // ═══ 平台识别（从内容语义判断，而非仅关键词命中）═══
   const lower = t.toLowerCase();
   let platform = '';
-  if (/tiktok/.test(lower)) platform = 'TikTok';
-  else if (/instagram|ig\b/.test(lower)) platform = 'Instagram';
-  else if (/youtube/.test(lower)) platform = 'YouTube';
-  else if (/facebook|fb\b/.test(lower)) platform = 'Facebook';
-  else if (/twitter|x\.com/.test(lower)) platform = 'Twitter/X';
-  else if (/pinterest/.test(lower)) platform = 'Pinterest';
-  else if (/reddit/.test(lower)) platform = 'Reddit';
-  else if (/blog/.test(lower)) platform = 'Blog';
+  // 更严格的匹配：需要是"在XX平台发帖/发视频"的语境
+  if (/\btiktok\b.*(?:video|post|review|account|profile|@)/i.test(t) || /(?:video|review|content).*\btiktok\b/i.test(t)) platform = 'TikTok';
+  else if (/\binstagram\b.*(?:post|reel|account|profile|@)/i.test(t) || /(?:post|reel|photo).*\binstagram\b/i.test(t)) platform = 'Instagram';
+  else if (/\byoutube\b.*(?:video|channel|review)/i.test(t) || /(?:video|review).*\byoutube\b/i.test(t)) platform = 'YouTube';
+  else if (/\bfacebook\b.*(?:page|group|post)/i.test(t)) platform = 'Facebook';
+  else if (/\bpinterest\b/i.test(t)) platform = 'Pinterest';
+  else if (/\breddit\b/i.test(t)) platform = 'Reddit';
+  else if (/\bblog\b/i.test(t)) platform = 'Blog';
+  // 如果全文只提到一次TikTok且是在"will provide a TikTok video"这种承诺语境中，也标记
+  if (!platform && /\btiktok\b/i.test(t)) platform = 'TikTok';
   if (platform) out.platform = platform;
-  // 金额 + 货币
+
+  // ═══ 金额 + 货币 ═══
   const curMap = [['¥', 'CNY'], ['￥', 'CNY'], ['RMB', 'CNY'], ['CNY', 'CNY'], ['€', 'EUR'], ['EUR', 'EUR'], ['£', 'GBP'], ['GBP', 'GBP'], ['\\$', 'USD'], ['USD', 'USD']];
   let cur = '', amt = '';
   for (const [sym, code] of curMap) {
@@ -5104,40 +5126,100 @@ function localExtract(text, kind) {
   }
   if (!amt) { const m = t.match(/(?:^|\s)(\d+(?:[.,]\d{1,2})?)\s*(?:usd|eur|gbp|cny|rmb|美元|欧|镑)/i); if (m) { amt = m[1].replace(',', '.'); cur = (m[2] || '').toUpperCase() || 'USD'; } }
   if (amt) { out.amount = amt; out.currency = cur || 'USD'; }
-  // 订单号
-  const onum = (t.match(/#\s?([A-Za-z0-9][\w-]{4,})/)) || (t.match(/(?:订单号|order\s*(?:#|no)?\.?\s*[:：]?\s*)([A-Za-z0-9][\w-]{4,})/i)) || (t.match(/\b(\d{6,})\b/));
+
+  // ═══ 订单号 ═══
+  const onum = (t.match(/#\s?([A-Za-z0-9][\w-]{4,})/))
+    || (t.match(/(?:订单号|order\s*(?:#|no)?\.?\s*[:：]?\s*)([A-Za-z0-9][\w-]{4,})/i))
+    || (t.match(/\b(\d{3}-\d{7}-\d{7})\b/));  // Amazon格式 111-8333069-5627461
   if (onum) out.orderNumber = onum[1];
-  // 店铺
+
+  // ═══ 店铺 ═══
   const store = t.match(/\b((?:HS|IB)[-\s]?(?:US|UK|DE|AU|CA|FR|IT|ES))\b/i);
   if (store) out.store = store[1].toUpperCase().replace(/\s/, '-');
-  // 国家
+
+  // ═══ 国家 ═══
   const ctry = t.match(/\b(US|USA|United States|DE|Germany|UK|United Kingdom|GB|AU|Australia|CA|Canada|FR|France|IT|Italy|ES|Spain|JP|Japan)\b/i);
   if (ctry) {
     const map = { usa: 'US', 'united states': 'US', uk: 'UK', 'united kingdom': 'UK', gb: 'UK', de: 'DE', germany: 'DE', au: 'AU', australia: 'AU', ca: 'CA', canada: 'CA', fr: 'FR', france: 'FR', it: 'IT', italy: 'IT', es: 'ES', spain: 'ES', jp: 'JP', japan: 'JP' };
     out.country = map[ctry[1].toLowerCase()] || ctry[1].toUpperCase();
   }
-  // 返款方式
-  if (/paypal/i.test(t)) { out.refundMethod = 'PayPal'; if (email) out.ppAccount = email; }
-  else if (/银行|bank/i.test(t)) out.refundMethod = '银行转账';
-  else if (/平台退款|refund/i.test(t)) out.refundMethod = '平台退款';
-  // 客户名 / 昵称
-  const nameM = t.match(/(?:客户|customer|name|姓名|昵称)[\s：:]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|$)/i);
-  if (nameM) { const nm = nameM[1].trim(); if (kind === 'lead') out.nickname = nm; else out.customerName = nm; }
-  else if (kind === 'lead') { const at = t.match(/@([\w.]{3,30})/); if (at) out.nickname = at[1]; }
-  // 产品
-  const prodM = t.match(/(?:产品|product|买了|purchase)[\s：:]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{1,30}?)(?:\n|$|\.)/i);
-  if (prodM) out.product = prodM[1].trim();
-  // 状态默认值
+
+  // ═══ 返款方式（智能判断客户选了哪个选项）═══
+  // 优先检测客户明确选择的选项，而非仅匹配关键词
+  if (/(?:选了?| chose | go with | option\s*2|第二|选项二|order through amazon|order on amazon|provide you my order number|平台退款|refund.*amazon)/i.test(t)) {
+    out.refundMethod = '平台退款';
+  } else if (/(?:paypal|pp\s*account|paypal邮箱)/i.test(t) && !/(?:don't have|no paypal|without paypal|not use paypal|选项二|option\s*2|第二)/i.test(t)) {
+    out.refundMethod = 'PayPal';
+    // PayPal账号用客户邮箱（非自邮）
+    if (customerEmail) out.ppAccount = customerEmail;
+  } else if (/银行|bank\s*transfer/i.test(t)) {
+    out.refundMethod = '银行转账';
+  }
+
+  // ═══ 客户名 / 昵称（多种模式）═══
+  let customerName = '';
+  // 模式1: "From: XXX" 或 "收件人:" 中的名字
+  const fromM = t.match(/From:\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,30}?)(?:\n|$|<)/i);
+  if (fromM) customerName = fromM[1].trim();
+  // 模式2: 邮件签名 "Best regards,\nXXX" 或 "-XXX"
+  if (!customerName) {
+    const sigM = t.match(/(?:Best regards|Regards|Thanks|Cheers|Thank you)[\s\S]{0,3}\n\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|$)/i);
+    if (sigM) customerName = sigM[1].trim().replace(/^[-–—\s]+/, '');
+  }
+  // 模式3: "Hi XXX," 开头称呼
+  if (!customerName) {
+    const hiM = t.match(/^(?:Hi|Hello|Hey|Dear)\s+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)[,，]/im);
+    if (hiM) {
+      const n = hiM[1].trim();
+      // 排除操作员自己的名字
+      if (!/anna/i.test(n)) customerName = n;
+    }
+  }
+  // 模式4: "My name is XXX"
+  if (!customerName) {
+    const nameM = t.match(/(?:My name is|I'm|This is)\s+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s.]{1,20}?)(?:\n|\.|,|$)/i);
+    if (nameM) customerName = nameM[1].trim();
+  }
+  if (customerName) {
+    if (kind === 'lead') out.nickname = customerName;
+    else out.customerName = customerName;
+  } else if (kind === 'lead') {
+    // 红人兜底：从邮箱前缀取昵称
+    const at = customerEmail ? customerEmail.match(/@([\w.]{3,30})/) : null;
+    if (at) out.nickname = at[1];
+  }
+
+  // ═══ 产品名（多种模式）═══
+  let product = '';
+  // 模式1: 编号列表 "1. Product Name for XXX" 或 "1. XXX"
+  const listM = t.match(/(?:^|\n)\d+\.\s*([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-/]{2,40}?)(?:\n|$|https?:|$)/i);
+  if (listM) product = listM[1].trim().replace(/\s*[（(].*[）)]\s*$/, '');  // 去掉括号注释
+  // 模式2: "产品|product" 关键词后跟名称
+  if (!product) {
+    const prodM = t.match(/(?:产品|product|买了|purchase|item|this product)[:：\s]+([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{2,30}?)(?:\n|$|\.|,|https?:)/i);
+    if (prodM) product = prodM[1].trim();
+  }
+  // 模式3: Amazon链接附近的文字 "XXX\nhttps://amzn.to/"
+  if (!product) {
+    const amznM = t.match(/([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\s\-]{2,35}?)\s*\n\s*https?:\/\/amzn\.to\//i);
+    if (amznM) product = amznM[1].trim().replace(/^\d+\.\s*/, '');
+  }
+  if (product) out.product = product;
+
+  // ═══ 状态默认值 ═══
   out.status = kind === 'lead' ? 'pending' : 'pending_refund';
-  // 关键信息摘要
+
+  // ═══ 关键信息摘要 ═══
   const found = [];
   if (out.orderNumber) found.push('订单号 ' + out.orderNumber);
   if (out.customerName || out.nickname) found.push('姓名 ' + (out.customerName || out.nickname));
-  if (out.email || out.customerEmail) found.push('邮箱 ' + (out.email || out.customerEmail));
+  if (out.customerEmail || out.email) found.push('邮箱 ' + (out.customerEmail || out.email));
   if (out.amount) found.push('金额 ' + out.currency + ' ' + out.amount);
+  if (out.product) found.push('产品 ' + out.product);
   if (out.country) found.push('国家 ' + out.country);
   if (out.store) found.push('店铺 ' + out.store);
   if (out.platform) found.push('平台 ' + out.platform);
+  if (out.refundMethod) found.push('返款方式 ' + out.refundMethod);
   let summary = found.length ? ('已识别：' + found.join('；') + '。') : '未识别到明显字段。';
   summary += ' 其余字段请手动补充后保存。';
   return { fields: out, summary, source: 'local' };
@@ -5153,7 +5235,16 @@ async function callAIExtract(text, kind) {
   const fieldList = kind === 'order'
     ? ['orderNumber', 'customerName', 'customerEmail', 'store', 'product', 'amount', 'currency', 'country', 'socialMediaUrl', 'refundMethod', 'ppAccount', 'status', 'reviewContent']
     : ['platform', 'nickname', 'profileUrl', 'country', 'product', 'email', 'status'];
-  const sys = `You are a data extraction assistant for an aquarium influencer/order management system. The user pastes a chat with a customer or influencer. Extract structured fields and return ONLY valid JSON: {"fields":{...},"summary":"key points in Chinese"}.
+  const selfEmails = (s._selfEmails || '').split(',').map(e => e.trim()).filter(Boolean).join(', ') || '(none)';
+  const sys = `You are a data extraction assistant for an aquarium influencer/order management system. The user pastes a chat/email with a customer or influencer. Extract structured fields and return ONLY valid JSON: {"fields":{...},"summary":"key points in Chinese"}.
+CRITICAL RULES:
+1. OPERATOR SELF-EMAILS (NEVER use these as customer email): ${selfEmails}. These belong to the operator (Anna from IBAY Aqua). The customer email is the OTHER person's email in the conversation.
+2. For "customerEmail"/"email": always pick the CUSTOMER's email, never the operator's. In email threads, look at "From:" and "To:" headers — the customer is the one who replied/ordered.
+3. For "refundMethod": detect which option the customer ACTUALLY chose. "I will order through Amazon" + "provide order number" = 平台退款(Amazon), NOT PayPal even if PayPal is mentioned as an unchosen option.
+4. For "product": look for product names near numbered lists, Amazon links, or phrases like "this product" / "test the XXX".
+5. For "customerName": check email signatures ("Best regards, XXX"), "From:" header, or "Hi XXX," salutation. Skip operator name (Anna).
+6. For "socialMediaUrl"/"profileUrl": skip e-commerce URLs (amazon, amzn, ebay, aliexpress, temu, shein). Only use actual social media profile links.
+7. E-commerce URLs (amzn.to, amazon.com/dp/, etc.) are PRODUCT links, NOT social media links. Put product info in "product" field instead.
 Field names when present: ${fieldList.join(', ')}.
 - Missing fields => empty string "".
 - order "status": one of pending_refund, transferred, reviewing, completed, abandoned.
@@ -5309,6 +5400,11 @@ function openFollowSettings() {
       <input type="password" id="fs-aikey" value="${esc(settings._aiKey || '')}" placeholder="留空=仅用本地提取" style="width:280px;text-align:left">
       <span class="hint">可选（用于「🤖 AI录入」与话术重写）</span>
     </div>
+    <div class="o-settings-row">
+      <label style="width:96px">我的邮箱</label>
+      <input type="text" id="fs-selfemails" value="${esc(settings._selfEmails || 'anna@ibayaqua.com')}" placeholder="anna@ibayaqua.com" style="width:280px;text-align:left">
+      <span class="hint">逗号分隔，AI录入时自动排除</span>
+    </div>
     <div style="display:flex;gap:10px;margin-top:20px">
       <button class="o-act-btn primary" style="flex:1;padding:10px" id="fs-save">保存设置</button>
       <button class="o-act-btn" style="flex:1;padding:10px" id="fs-close">关闭</button>
@@ -5325,6 +5421,7 @@ function openFollowSettings() {
     newSettings._aiKey = $('#fs-aikey').value.trim();
     newSettings._aiEndpoint = $('#fs-aiendpoint').value.trim() || 'https://api.openai.com/v1';
     newSettings._aiModel = $('#fs-aimodel').value.trim() || 'gpt-4o-mini';
+    newSettings._selfEmails = $('#fs-selfemails').value.trim() || 'anna@ibayaqua.com';
     saveOutreachSettings(newSettings);
     toast('设置已保存', 'success');
     close();
