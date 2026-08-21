@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260821b';
+const APP_VERSION = '20260821d';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -1475,9 +1475,26 @@ async function renderRecentActivity() {
     });
   });
   items.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
-  const top = items.slice(0, 14);
-  if (!top.length) return '<div class="ra-empty">暂无动态，去「红人跟进」添加或推进红人吧</div>';
-  return `<div class="ra-list">${top.map((it) => {
+  if (!items.length) return '<div class="ra-empty">暂无动态，去「红人跟进」添加或推进红人吧</div>';
+  const startToday = new Date();
+  startToday.setHours(0, 0, 0, 0);
+  const startTodayMs = startToday.getTime();
+  const groups = [];
+  let cur = null, curKey = null;
+  items.forEach((it) => {
+    const d = new Date(String(it.ts).includes('T') ? it.ts : it.ts + 'T00:00:00');
+    let key;
+    if (isNaN(d.getTime())) {
+      key = '更早';
+    } else {
+      const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+      const diffDays = Math.floor((startTodayMs - dayStart) / 86400000);
+      key = diffDays <= 0 ? '今天' : diffDays === 1 ? '昨天' : (d.getMonth() + 1) + '/' + d.getDate();
+    }
+    if (!cur || cur.key !== key) { cur = { key, rows: [] }; groups.push(cur); }
+    cur.rows.push(it);
+  });
+  const rowHtml = (it) => {
     const col = OUTREACH_COLORS[it.status] || '#94a3b8';
     return `<div class="ra-row" data-k-act="open" data-id="${esc(it.id)}" title="点击查看 ${esc(it.nick)}">
       <span class="ra-dot" style="background:${col}"></span>
@@ -1487,7 +1504,49 @@ async function renderRecentActivity() {
       </div>
       <span class="ra-time">${timeAgo(it.ts)}</span>
     </div>`;
-  }).join('')}</div>`;
+  };
+  return `<div class="ra-list">${groups.map((g) => `<div class="ra-group"><div class="ra-group-title">${esc(g.key)}</div>${g.rows.map(rowHtml).join('')}</div>`).join('')}</div>`;
+}
+
+async function renderMonthlyReport() {
+  const leads = await getAll('leads');
+  const now = new Date();
+  const thisYM = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+  const monthOf = (d) => {
+    if (!d) return '';
+    const dt = new Date(d);
+    if (isNaN(dt.getTime())) return '';
+    return dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0');
+  };
+  let newLeads = 0, advances = 0, reviewed = 0, abandoned = 0, active = 0;
+  const totalReviewed = leads.filter((l) => l.status === 'reviewed').length;
+  leads.forEach((l) => {
+    if (monthOf(l.createdAt) === thisYM) newLeads++;
+    if (['reviewed', 'abandoned'].includes(l.status)) {
+      if (l.status === 'reviewed' && monthOf(l.updatedAt) === thisYM) reviewed++;
+      else if (l.status === 'abandoned' && monthOf(l.updatedAt) === thisYM) abandoned++;
+    } else {
+      active++;
+    }
+    (l.commLog || []).forEach((e) => {
+      if (monthOf(e.ts || e.date) === thisYM && String(e.action || '').startsWith('状态:')) advances++;
+    });
+  });
+  const rate = newLeads ? Math.round((reviewed / newLeads) * 1000) / 10 : 0;
+  const monthLabel = now.getFullYear() + '年' + (now.getMonth() + 1) + '月';
+  const cell = (num, label, cls) => `<div class="rep-cell ${cls || ''}"><div class="rep-num">${typeof num === 'number' ? fmtInt(num) : esc(String(num))}</div><div class="rep-label">${label}</div></div>`;
+  return `<div class="rep-wrap">
+    <div class="rep-month">${monthLabel} · 红人跟进成果</div>
+    <div class="rep-grid">
+      ${cell(newLeads, '本月新增')}
+      ${cell(advances, '推进动作')}
+      ${cell(reviewed, '成功留评', 'rep-good')}
+      ${cell(abandoned, '放弃', 'rep-bad')}
+      ${cell(active, '活跃中')}
+      ${cell(rate + '%', '留评率', 'rep-hl')}
+    </div>
+    <div class="rep-foot">本月新增 ${newLeads} 位红人，其中 ${reviewed} 位成功留评（留评率 ${rate}%）；累计已留评 ${totalReviewed} 位，当前活跃跟进 ${active} 位。</div>
+  </div>`;
 }
 
 function kanbanCard(l, status) {
@@ -1547,6 +1606,7 @@ async function renderDashboard(c) {
 
   const kanbanHtml = await renderOutreachKanban();
   const activityHtml = await renderRecentActivity();
+  const reportHtml = await renderMonthlyReport();
   const dashStyle = `<style>
     .collapse-card { border:1px solid #eaeaea; border-radius:12px; margin-top:16px; background:#fff; overflow:hidden; }
     .collapse-head { display:flex; align-items:center; gap:8px; padding:13px 16px; cursor:pointer; user-select:none; background:#fafafa; }
@@ -1593,6 +1653,18 @@ async function renderDashboard(c) {
     .ra-detail { font-size:12px; color:#94a3b8; margin-top:2px; }
     .ra-time { font-size:11px; color:#cbd5e1; white-space:nowrap; flex:0 0 auto; margin-top:2px; }
     .ra-empty { font-size:13px; color:#bbb; text-align:center; padding:20px 0; }
+    .ra-group { margin-bottom:10px; }
+    .ra-group-title { font-size:12px; font-weight:700; color:#94a3b8; margin:6px 0 4px; padding-left:2px; }
+    .rep-wrap { }
+    .rep-month { font-size:13px; font-weight:700; color:#475569; margin-bottom:10px; }
+    .rep-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; }
+    .rep-cell { background:#f8f9fb; border:1px solid #eef0f2; border-radius:10px; padding:14px 8px; text-align:center; }
+    .rep-num { font-size:22px; font-weight:800; color:#1f2937; line-height:1.1; }
+    .rep-label { font-size:12px; color:#64748b; margin-top:5px; }
+    .rep-good .rep-num { color:#22c55e; }
+    .rep-bad .rep-num { color:#ef4444; }
+    .rep-hl .rep-num { color:#0ea5e9; }
+    .rep-foot { font-size:12.5px; color:#64748b; margin-top:12px; line-height:1.6; }
   </style>`;
 
   c.innerHTML = `${dashStyle}<div class="maxw">
@@ -1637,6 +1709,8 @@ async function renderDashboard(c) {
     </div>`)}
 
     ${collapseSection('kanban', '🎯 红人阶段看板', kanbanHtml, '<button class="btn btn-sm" data-go="outreach">跳转红人跟进 →</button>')}
+
+    ${collapseSection('report', '📅 本月跟进报告', reportHtml, '<button class="btn btn-sm" data-go="outreach">查看全部 →</button>')}
 
     ${collapseSection('activity', '🔔 最近动态', activityHtml, '<button class="btn btn-sm" data-go="outreach">查看全部 →</button>')}
 
@@ -4557,6 +4631,7 @@ function computeOutreachActions(leads) {
   const groups = { A: [], B: [], C: [] };
   leads.forEach((l) => {
     if (l.status === 'reviewed' || l.status === 'abandoned') return;
+    if (l.snoozeUntil && new Date(l.snoozeUntil) > today) return;
     const cfg = OUTREACH_STATUS[l.status];
     if (!cfg || !cfg.nextAction) return;
     const interval = getOutreachInterval(l);
@@ -4580,6 +4655,15 @@ function computeOutreachActions(leads) {
 function outreachBadge(s) {
   const m = OUTREACH_STATUS[s] || { label: s || '—', cls: 'neutral' };
   return `<span class="badge ${m.cls}">${esc(m.label)}</span>`;
+}
+
+/* overdue highlight: deeper red the longer it's overdue */
+function overdueColor(o) {
+  if (!o || o <= 0) return '#e5e7eb';
+  if (o <= 2) return '#fbbf24';
+  if (o <= 4) return '#fb923c';
+  if (o <= 6) return '#f87171';
+  return '#ef4444';
 }
 
 /* ---------- message templates ---------- */
@@ -4658,6 +4742,7 @@ async function renderOutreach(c, keepScroll) {
     .o-action-item .o-nick { font-weight:600; font-size:13px; }
     .o-action-item .o-meta { font-size:12px; color:#888; }
     .o-action-item .o-act { margin-left:auto; font-size:12px; color:#0066cc; cursor:pointer; white-space:nowrap; }
+    .o-action-item .o-do { font-size:12px; color:#64748b; margin-top:3px; }
     .o-action-item .o-act:hover { text-decoration:underline; }
     .o-action-empty { font-size:13px; color:#999; padding:4px 0; }
     .o-table { width:100%; border-collapse:collapse; }
@@ -4734,21 +4819,21 @@ async function renderOutreach(c, keepScroll) {
     if (actions.A.length) {
       html += `<div class="o-action-group"><div class="o-action-group-title">A · 发私信 / 指导下单 (${actions.A.length})</div><div class="o-action-items">`;
       actions.A.forEach((l) => {
-        html += `<div class="o-action-item"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><span class="o-act" data-o-act="go-msg" data-id="${esc(l.id)}">${esc(OUTREACH_STATUS[l.status]?.nextAction || '处理')} →</span></div>`;
+        html += `<div class="o-action-item" style="align-items:flex-start;border-left:4px solid ${overdueColor(l.overdue)}"><div style="flex:1;min-width:0"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><div class="o-do">→ ${esc(OUTREACH_STATUS[l.status]?.nextAction || '处理')}${l.overdue ? ` · 超 ${l.overdue} 天` : ''}</div></div><div class="o-act-btns"><button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${OUTREACH_TRANSITIONS[l.status]?.[0]?.to || ''}">推进</button><button class="o-act-btn" data-o-act="go-msg" data-id="${esc(l.id)}">生成消息</button><button class="o-act-btn" data-o-act="snooze" data-id="${esc(l.id)}">延后3天</button></div></div>`;
       });
       html += `</div></div>`;
     }
     if (actions.B.length) {
       html += `<div class="o-action-group"><div class="o-action-group-title">B · 未回复追单 (${actions.B.length})</div><div class="o-action-items">`;
       actions.B.forEach((l) => {
-        html += `<div class="o-action-item"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">超 ${l.overdue || 0} 天</span><span class="o-act" data-o-act="go-msg" data-id="${esc(l.id)}">发提醒 →</span></div>`;
+        html += `<div class="o-action-item" style="align-items:flex-start;border-left:4px solid ${overdueColor(l.overdue)}"><div style="flex:1;min-width:0"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><div class="o-do">→ ${esc(OUTREACH_STATUS[l.status]?.nextAction || '发提醒')} · 超 ${l.overdue || 0} 天</div></div><div class="o-act-btns"><button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${OUTREACH_TRANSITIONS[l.status]?.[0]?.to || ''}">推进</button><button class="o-act-btn" data-o-act="go-msg" data-id="${esc(l.id)}">生成消息</button><button class="o-act-btn" data-o-act="snooze" data-id="${esc(l.id)}">延后3天</button></div></div>`;
       });
       html += `</div></div>`;
     }
     if (actions.C.length) {
       html += `<div class="o-action-group"><div class="o-action-group-title">C · 索评跟进 (${actions.C.length})</div><div class="o-action-items">`;
       actions.C.forEach((l) => {
-        html += `<div class="o-action-item"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">超 ${l.overdue || 0} 天</span><span class="o-act" data-o-act="go-msg" data-id="${esc(l.id)}">${esc(OUTREACH_STATUS[l.status]?.nextAction || '索评')} →</span></div>`;
+        html += `<div class="o-action-item" style="align-items:flex-start;border-left:4px solid ${overdueColor(l.overdue)}"><div style="flex:1;min-width:0"><span class="o-platform-ico">${esc(platformIcon(l.platform))}</span><span class="o-nick">${esc(l.nickname || '—')}</span>${outreachBadge(l.status)}<span class="o-meta">${esc(l.product || '')}</span><div class="o-do">→ ${esc(OUTREACH_STATUS[l.status]?.nextAction || '索评')} · 超 ${l.overdue || 0} 天</div></div><div class="o-act-btns"><button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${OUTREACH_TRANSITIONS[l.status]?.[0]?.to || ''}">推进</button><button class="o-act-btn" data-o-act="go-msg" data-id="${esc(l.id)}">生成消息</button><button class="o-act-btn" data-o-act="snooze" data-id="${esc(l.id)}">延后3天</button></div></div>`;
       });
       html += `</div></div>`;
     }
@@ -4809,7 +4894,7 @@ async function renderOutreach(c, keepScroll) {
   }
   // button delegations
   $$('[data-o-act]', c).forEach((btn) => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const act = btn.dataset.oAct;
       const id = btn.dataset.id;
       if (act === 'new') openLeadForm(null);
@@ -4819,6 +4904,18 @@ async function renderOutreach(c, keepScroll) {
       else if (act === 'transition') transitionLead(id, btn.dataset.to);
       else if (act === 'msg') { const lead = allLeads.find((x) => x.id === id); if (lead) openMessageGen(lead); }
       else if (act === 'go-msg') { const lead = allLeads.find((x) => x.id === id); if (lead) openMessageGen(lead); }
+      else if (act === 'snooze') {
+        const lead = allLeads.find((x) => x.id === id);
+        if (lead) {
+          const d = new Date();
+          d.setDate(d.getDate() + 3);
+          lead.snoozeUntil = d.toISOString();
+          lead.updatedAt = new Date().toISOString();
+          await putOne('leads', lead);
+          toast('已延后 3 天跟进', 'success');
+          render();
+        }
+      }
     });
   });
 }
@@ -4879,10 +4976,12 @@ function openLeadForm(lead) {
       </select>
     </div>
     <div class="o-form-row">
-      <label>提醒天数</label>
+      <label>下次提醒间隔</label>
       <input type="number" id="lf-days" value="${l.reminderDays != null ? l.reminderDays : ''}" placeholder="留空=用全局默认" min="0" max="365">
-      <span style="font-size:12px;color:#999">覆盖全局设置（留空=默认）</span>
-    </div>` : ''}
+      <span style="font-size:12px;color:#999">天 · 上次操作后几天提醒（0=每天）</span>
+    </div>
+    <div style="font-size:12px;color:#2563eb;margin:-4px 0 10px 80px" id="lf-next-hint"></div>
+  ` : ''}
     <div class="o-form-row">
       <label>备注</label>
       <textarea id="lf-notes" placeholder="备注信息…">${esc(l.notes || '')}</textarea>
@@ -4894,6 +4993,24 @@ function openLeadForm(lead) {
   `;
   const { close } = openModal(html);
   $('#lf-cancel').addEventListener('click', close);
+  const lfDays = $('#lf-days');
+  if (lfDays) {
+    const updateHint = () => {
+      const v = lfDays.value.trim();
+      const days = v === '' ? (getOutreachSettings()[l.status] ?? OUTREACH_STATUS[l.status].defaultDays) : Number(v);
+      let txt = '—';
+      if (days === 0) txt = '每天提醒（无需等待）';
+      else if (!isNaN(days) && days > 0) {
+        const base = new Date(l.lastActionDate || l.createdAt || Date.now());
+        base.setDate(base.getDate() + days);
+        txt = '预计下次提醒：' + fmtDate(base.toISOString());
+      }
+      const hint = $('#lf-next-hint');
+      if (hint) hint.textContent = txt;
+    };
+    lfDays.addEventListener('input', updateHint);
+    updateHint();
+  }
   $('#lf-save').addEventListener('click', async () => {
     const data = {
       platform: $('#lf-platform').value,
@@ -4942,18 +5059,27 @@ function openFollowSettings() {
   const settings = getOutreachSettings();
   const editable = Object.entries(OUTREACH_STATUS).filter(([, v]) => v.defaultDays != null);
   let html = `
-    <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">⚙ 跟进设置</h3>
-    <p style="font-size:13px;color:#888;margin-bottom:16px">设置每个状态的默认提醒天数。到天数未操作的红人会出现在「今日下一步」面板。</p>
+    <h3 style="font-size:18px;font-weight:700;margin-bottom:6px">⚙ 智能跟进提醒</h3>
+    <div style="font-size:13px;color:#555;line-height:1.7;background:#f6f8fa;border-radius:10px;padding:12px 14px;margin-bottom:16px">
+      <b>它怎么工作：</b>每个状态设一个「间隔天数」= 上次操作后，等几天再提醒你跟进。例如「已联系=3天」表示：联系后若超过 3 天没新动作，这个人会出现在首页「今日下一步」提醒你。<br>
+      <b>有人需要放养？</b>在红人编辑页可单独调「下次提醒间隔」，覆盖这里的全局默认值。
+    </div>
+    <div style="display:flex;gap:10px;font-size:12px;color:#888;margin-bottom:8px;font-weight:600">
+      <div style="width:96px">状态</div>
+      <div style="width:64px;text-align:center">间隔(天)</div>
+      <div style="flex:1">到期动作（到点后提醒你做什么）</div>
+    </div>
     ${editable.map(([key, cfg]) => `
-      <div class="o-settings-row">
-        <label>${esc(cfg.label)}</label>
-        <input type="number" min="0" max="365" id="fs-${key}" value="${settings[key] ?? cfg.defaultDays}">
-        <span class="hint">天 ${cfg.nextAction ? '（' + esc(cfg.nextAction) + '）' : ''}</span>
+      <div class="o-settings-row" style="align-items:flex-start">
+        <label style="width:96px">${esc(cfg.label)}</label>
+        <input type="number" min="0" max="365" id="fs-${key}" value="${settings[key] ?? cfg.defaultDays}" style="width: 64px;text-align:center">
+        <span class="hint" style="flex: 1">${cfg.nextAction ? '→ 到期提醒：' + esc(cfg.nextAction) : ''}</span>
       </div>
     `).join('')}
+    <div style="font-size:12px;color:#94a3b8;margin:6px 0 0 106px">0 = 每天提醒（如「待开发」需立刻私信）；留空则沿用上方数值</div>
     <hr style="margin:16px 0;border:none;border-top:1px solid #eee">
     <div class="o-settings-row">
-      <label>AI 重写密钥</label>
+      <label style="width:96px">AI 重写密钥</label>
       <input type="password" id="fs-aikey" value="${esc(settings._aiKey || '')}" placeholder="留空=关闭 AI 重写" style="width:280px;text-align:left">
       <span class="hint">可选（OpenAI/兼容 API Key）</span>
     </div>
