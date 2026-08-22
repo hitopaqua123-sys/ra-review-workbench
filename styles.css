@@ -485,3 +485,17 @@ tr.group-row td{background:#f3f3f3;font-weight:800;color:#111;padding:8px 14px;b
 .order-link:hover{color:#0d47a1;border-bottom-style:solid}
 .customer-name-link{color:#1a56db;cursor:pointer;font-weight:600;text-decoration:none}
 .customer-name-link:hover{text-decoration:underline}
+
+/* ---------- 状态变更历史时间线 ---------- */
+.status-timeline{display:flex;flex-direction:column;gap:4px}
+.st-row{display:flex;align-items:center;gap:10px;font-size:12px;padding:3px 0;border-bottom:1px solid #f0f0f0}
+.st-row:last-child{border-bottom:none}
+.st-latest{background:#f8f9fa;border-radius:4px;padding:4px 6px;margin:-2px -2px -2px 0}
+.st-time{color:#6b7280;font-size:11px;min-width:120px;font-family:monospace;white-space:nowrap}
+.st-badge{font-size:11px}
+.st-op{color:#9ca3af;font-size:11px;margin-left:auto}
+
+/* 表格状态badge hover浮窗 */
+.st-hover-trigger{position:relative;cursor:help}
+.st-popup{display:none;position:absolute;left:50%;bottom:calc(100% + 6px);transform:translateX(-50%);z-index:100;background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.15);padding:12px 14px;min-width:280px;max-width:360px;pointer-events:none}
+.st-hover-trigger:hover .st-popup{display:block}

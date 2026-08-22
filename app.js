@@ -13,9 +13,10 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':
 const fmtMoney = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
+const fmtDateTime = (s) => { if (!s) return '—'; const d = String(s); return d.length > 10 ? d.slice(0, 16).replace('T', ' ') : d; };
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260822d';
+const APP_VERSION = '20260822e';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -4887,6 +4888,37 @@ function outreachBadge(s) {
   return `<span class="badge ${m.cls}">${esc(m.label)}</span>`;
 }
 
+/** 渲染红人状态变更历史时间线（用于弹窗底部或hover浮窗） */
+function renderStatusTimeline(statusHistory) {
+  if (!statusHistory || !statusHistory.length) return '<div style="font-size:12px;color:#999;padding:8px 0">暂无状态变更记录</div>';
+  // 倒序：最新在前
+  const items = [...statusHistory].reverse();
+  return `<div class="status-timeline">${items.map((h, i) => {
+    const sm = OUTREACH_STATUS[h.status] || { label: h.status || '?', cls: 'neutral' };
+    const timeStr = h.time ? fmtDateTime(h.time) : (h.date || '');
+    return `<div class="st-row${i === 0 ? ' st-latest' : ''}">
+      <span class="st-time">${esc(timeStr)}</span>
+      <span class="badge badge-${sm.cls} st-badge">${esc(sm.label)}</span>
+      <span class="st-op">${esc(h.operator || '系统')}</span>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+/** 状态badge带hover浮窗（主表格用） */
+function outreachBadgeWithHover(l) {
+  const s = l.status;
+  const m = OUTREACH_STATUS[s] || { label: s || '—', cls: 'neutral' };
+  const hasHistory = l.statusHistory && l.statusHistory.length > 1;
+  if (!hasHistory) {
+    return `<span class="badge ${m.cls}">${esc(m.label)}</span>`;
+  }
+  // hover时显示完整时间线浮窗
+  const timelineHtml = renderStatusTimeline(l.statusHistory);
+  return `<span class="badge ${m.cls} st-hover-trigger" data-st-hover>${esc(m.label)}
+    <div class="st-popup">${timelineHtml}</div>
+  </span>`;
+}
+
 /* overdue highlight: deeper red the longer it's overdue */
 function overdueColor(o) {
   if (!o || o <= 0) return '#e5e7eb';
@@ -5098,7 +5130,7 @@ async function renderOutreach(c, keepScroll) {
         <td>${esc(l.country || '—')}</td>
         <td>${esc(l.product || '—')}</td>
         <td>${l.email ? `<a class="o-link" href="mailto:${esc(l.email)}">${esc(l.email)}</a>` : '—'}</td>
-        <td>${outreachBadge(l.status)}</td>
+        <td>${outreachBadgeWithHover(l)}</td>
         <td>${esc(fmtDate(l.lastActionDate || l.createdAt))}</td>
         <td><div class="o-act-btns" onclick="event.stopPropagation()">
           ${transitions.map((t) => `<button class="o-act-btn st-${esc(l.status)}" data-o-act="transition" data-id="${esc(l.id)}" data-to="${esc(t.to)}">${esc(t.label)}</button>`).join('')}
@@ -5232,6 +5264,12 @@ function openLeadForm(lead, opts = {}) {
       <button class="o-act-btn primary" style="flex:1;padding:10px" id="lf-save">${isEdit ? '保存' : '创建'}</button>
       <button class="o-act-btn" style="flex:1;padding:10px" id="lf-cancel">取消</button>
     </div>
+    ${isEdit ? `
+    <div class="status-history-section" style="margin-top:18px;padding-top:14px;border-top:1px solid #e5e7eb">
+      <h4 style="font-size:13px;font-weight:600;margin:0 0 10px 0;color:#374151">📋 状态变更历史</h4>
+      <div id="lf-status-history"></div>
+    </div>
+    ` : ''}
   `;
   const { close } = openModal(html);
   $('#lf-cancel').addEventListener('click', close);
@@ -5252,6 +5290,18 @@ function openLeadForm(lead, opts = {}) {
     };
     lfDays.addEventListener('input', updateHint);
     updateHint();
+  }
+  // 渲染状态变更历史（仅编辑模式）
+  if (isEdit) {
+    const histBox = $('#lf-status-history');
+    if (histBox) {
+      // 确保 statusHistory 存在（兼容旧数据）
+      if (!lead.statusHistory || !lead.statusHistory.length) {
+        // 从 commLog 中恢复或创建初始记录
+        lead.statusHistory = [{ time: (lead.createdAt || lead.lastActionDate || new Date().toISOString()), status: lead.status || 'pending', operator: '系统' }];
+      }
+      histBox.innerHTML = renderStatusTimeline(lead.statusHistory);
+    }
   }
   $('#lf-save').addEventListener('click', async () => {
     const data = {
@@ -5274,9 +5324,12 @@ function openLeadForm(lead, opts = {}) {
       data.updatedAt = new Date().toISOString();
       data.reminderDays = $('#lf-days') ? $('#lf-days').value : lead.reminderDays;
       data.commLog = lead.commLog || [];
+      // 状态变更历史
+      data.statusHistory = Array.isArray(lead.statusHistory) ? [...lead.statusHistory] : [{ time: (lead.createdAt || lead.lastActionDate), status: lead.status || 'pending', operator: '系统' }];
       if (statusChanged) {
         const ts = new Date().toISOString();
         data.commLog.push({ ts, date: ts.slice(0, 10), action: `状态: ${OUTREACH_STATUS[lead.status]?.label || lead.status} → ${OUTREACH_STATUS[newStatus]?.label || newStatus}`, detail: '通过编辑表单修改' });
+        data.statusHistory.push({ time: ts, status: newStatus, operator: 'Anna' });
       }
       await putOne('leads', data);
       toast('已保存', 'success');
@@ -5288,6 +5341,7 @@ function openLeadForm(lead, opts = {}) {
       data.createdAt = now;
       data.updatedAt = now;
       data.commLog = [{ ts: now, date: now.slice(0, 10), action: '创建', detail: '新发现红人' }];
+      data.statusHistory = [{ time: now, status: data.status, operator: '系统' }];
       await putOne('leads', data);
       toast('已创建，状态：待开发', 'success');
     }
@@ -6016,12 +6070,14 @@ async function transitionLead(id, newStatus) {
   lead.lastActionDate = now;
   lead.updatedAt = now;
   if (!lead.commLog) lead.commLog = [];
+  if (!Array.isArray(lead.statusHistory)) lead.statusHistory = [{ time: (lead.createdAt || lead.lastActionDate), status: oldStatus || 'pending', operator: '系统' }];
   lead.commLog.push({
     ts: now,
     date: now.slice(0, 10),
     action: `状态: ${OUTREACH_STATUS[oldStatus]?.label || oldStatus} → ${cfg.label}`,
     detail: cfg.nextAction ? `下一步: ${cfg.nextAction}` : '终止',
   });
+  lead.statusHistory.push({ time: now, status: newStatus, operator: 'Anna' });
   await putOne('leads', lead);
   toast(`已流转至「${cfg.label}」${cfg.nextAction ? '，下一步: ' + cfg.nextAction : ''}`, 'success');
   render();
