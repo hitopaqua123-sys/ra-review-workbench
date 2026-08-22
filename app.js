@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260821h';
+const APP_VERSION = '20260821i';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -110,7 +110,21 @@ const ORDER_STATUS = {
 };
 // 向后兼容：旧代码用 STATUS 引用
 const STATUS = ORDER_STATUS;
-const statusBadge = (s) => { const m = STATUS[s] || { label: s || '—', cls: 'neutral' }; return `<span class="badge ${m.cls}">${esc(m.label)}</span>`; };
+// 旧数据值 → 新值映射（确保旧数据也能正确显示）
+const STATUS_LEGACY_MAP = {
+  refunded: 'transferred',       // 旧"已返款" → 新"已转账"
+  reviewed: 'reviewed',           // 已评价 → 已留评（同名）
+  pending_refund: 'pending_refund', // 待返款（不变）
+};
+const normOrderStatus = (s) => {
+  const v = String(s || '').trim();
+  return STATUS_LEGACY_MAP[v] || v || 'pending_refund';
+};
+const statusBadge = (s) => {
+  const normed = normOrderStatus(s);
+  const m = STATUS[normed] || { label: s || '—', cls: 'neutral' };
+  return `<span class="badge ${m.cls}">${esc(m.label)}</span>`;
+};
 
 const COUNTRY_CURRENCY = {
   US: 'USD', CA: 'CAD', GB: 'GBP', UK: 'GBP', DE: 'EUR', FR: 'EUR', IT: 'EUR', ES: 'EUR',
@@ -2557,8 +2571,11 @@ async function renderOrders(c, keepScroll = false) {
           else if (c.key === 'linkedLeadId') { v = x.linkedLeadId ? `<td><span class="badge" style="background:#8b5cf6;color:#fff;font-size:11px;cursor:pointer" data-jump-lead="${x.linkedLeadId}" title="点击查看红人详情">📌 红人</span></td>` : `<td>—</td>`; }
           else if (c.key === 'commentSummary') {
             const cms = x.comments || [];
-            if (!cms.length) v = `<td>—</td>`;
-            else if (cms.length === 1) {
+            if (!cms.length) {
+              // 没有关联评论时，显示反馈/沟通内容预览
+              const fb = (x.feedback || '').slice(0, 80);
+              v = `<td class="cell-ellipsis" style="max-width:220px">${fb ? esc(fb) + (x.feedback.length > 80 ? '…' : '') : '<span class="muted">—</span>'}</td>`;
+            } else if (cms.length === 1) {
               const txt = (cms[0].content || '').slice(0, 60);
               const imgN = (cms[0].images || []).length;
               v = `<td class="cell-ellipsis">${esc(txt)}${imgN ? ` <span class="tiny">${imgN}图</span>` : ''}<button class="link comment-open" data-cid="${esc(x.id)}" title="打开评论管理">⤢</button></td>`;
@@ -2571,6 +2588,7 @@ async function renderOrders(c, keepScroll = false) {
           }
           else if (c.key === 'product') v = `<td class="cell-ellipsis">${esc(x.product)}</td>`;
           else if (c.key === '__formula__') v = `<td class="num">${esc(applyFormula(c.formulaExpr, x))}</td>`;
+          else if (c.key === 'store') v = `<td style="max-width:80px">${esc(x.store)}</td>`;
           else v = `<td>${esc(x[c.key])}</td>`;
           if (c.person && x[c.key]) v = `<td><span class="avatar">${esc(String(x[c.key])[0] || '?')}</span></td>`;
           if (c.alert && !isNaN(Number(x[c.key]))) { const num = Number(x[c.key]); if ((c.alert.op === '>' && num > c.alert.value) || (c.alert.op === '<' && num < c.alert.value)) v = v.replace('<td', '<td class="cell-alert"'); }
