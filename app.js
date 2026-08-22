@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260822b';
+const APP_VERSION = '20260822c';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -309,13 +309,36 @@ function openDB() {
 }
 async function db() { if (!_db) _db = await openDB(); return _db; }
 function tx(store, mode) { return db().then((d) => d.transaction(store, mode).objectStore(store)); }
+// 图片 URL 归一化：提取 data URL 的纯 base64 内容用于比较（处理同一张图粘贴两次产生不同 metadata 前缀的情况）
+function imageFingerprint(url) {
+  if (!url) return '';
+  const commaIdx = url.indexOf(',');
+  return commaIdx >= 0 ? url.substring(commaIdx + 1).replace(/\s/g, '').slice(0, 200) : url;
+}
+// 强化版图片数组去重：先用 Set 做 URL 精确去重，再用指纹做语义去重（同一张图不同 URL）
+function dedupImages(arr) {
+  if (!Array.isArray(arr)) return [];
+  // 第1轮：精确 URL 去重
+  let result = [...new Set(arr.filter(Boolean))];
+  if (result.length <= 1) return result;
+  // 第2轮：指纹去重（同一张图的不同 data URL 变体）
+  const seen = new Set();
+  result = result.filter((url) => {
+    const fp = imageFingerprint(url);
+    if (!fp || seen.has(fp)) return false;
+    seen.add(fp);
+    return true;
+  });
+  return result;
+}
+
 function migrateOrder(o) {
   if (!o) return o;
   let changed = false;
   if (!Array.isArray(o.reviewImages)) { o.reviewImages = []; changed = true; }
-  // 去重：reviewImages 中如有重复 URL 只保留一份
-  if (Array.isArray(o.reviewImages) && o.reviewImages.length !== new Set(o.reviewImages).size) {
-    o.reviewImages = [...new Set(o.reviewImages)];
+  // 去重：reviewImages 中如有重复 URL 或同一张图的不同变体只保留一份
+  if (Array.isArray(o.reviewImages) && o.reviewImages.length !== dedupImages(o.reviewImages).length) {
+    o.reviewImages = dedupImages(o.reviewImages);
     changed = true;
   }
   // 不再自动将 reviewScreenshotUrl 合并到 reviewImages（两者是独立字段，避免计数重复）
@@ -740,9 +763,9 @@ async function bindImagesEdit(root, rec, store, field = 'reviewImages', onChange
       if (!rec[field]) rec[field] = [];
       if (!rec[field].includes(dataUrl)) rec[field].push(dataUrl);
     }
-    // 去重：防止粘贴重复图片
-    if (rec[field] && rec[field].length !== new Set(rec[field]).size) {
-      rec[field] = [...new Set(rec[field])];
+    // 去重：防止粘贴重复图片（含同一张图不同URL的语义去重）
+    if (rec[field] && rec[field].length) {
+      rec[field] = dedupImages(rec[field]);
     }
     // 自动推进状态：订单有评价截图时，自动将状态提升为「已评论」
     if (field === 'reviewImages' && store === 'orders' && rec[field] && rec[field].length > 0) {
@@ -4052,7 +4075,7 @@ async function syncOrderReviewToComments(order) {
     // 更新最近一条关联评论：同步所有关键字段（不仅是评论字段）
     const target = matched[0];
     target.reviewContent = order.reviewContent || '';
-    target.images = Array.isArray(order.reviewImages) ? [...new Set(order.reviewImages.slice())] : [];
+    target.images = Array.isArray(order.reviewImages) ? dedupImages(order.reviewImages.slice()) : [];
     target.reviewSubmitDate = order.reviewSubmitDate || null;
     target.feedback = order.feedback || '';
     // 同步客户/产品/店铺/状态等全部可变字段
@@ -4107,7 +4130,7 @@ async function syncOrderReviewToComments(order) {
     reviewSubmitDate: order.reviewSubmitDate || null,
     reviewContent: order.reviewContent || '',
     feedback: order.feedback || '',
-    images: Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [],
+    images: Array.isArray(order.reviewImages) ? dedupImages(order.reviewImages) : [],
     createdAt: now,
     updatedAt: now,
   };
@@ -4124,7 +4147,8 @@ async function syncOrderReviewToComments(order) {
 // ② 有评价截图的订单自动标记为「已评论」
 // ③ 按订单状态为准，把关联评论的 reviewStatus 对齐（解决订单与评论状态不一致）
 async function repairOrdersData() {
-  if (!confirm('将执行一次性数据修复（仅处理已有历史数据）：\n\n1. 所有订单/评论的重复截图自动去重\n2. 有评价截图的订单自动标记为「已评论」\n3. 按「订单状态为准」对齐评论状态（待回访/已评论等）\n\n是否继续？')) return;
+  const isAuto = !arguments.length || arguments[0] !== false; // 自动调用时不弹确认框
+  if (!isAuto && !confirm('将执行一次性数据修复（仅处理已有历史数据）：\n\n1. 所有订单/评论的重复截图自动去重（含同一张图不同URL）\n2. 有评价截图的订单自动标记为「已评论」\n3. 按「订单状态为准」对齐评论状态（待回访/已评论等）\n\n是否继续？')) return;
   const orders = await getAll('orders');
   const comments = await getAll('comments');
   let dedupOrders = 0, dedupComments = 0, promoted = 0, synced = 0;
@@ -4132,10 +4156,10 @@ async function repairOrdersData() {
   const statusMap = { pending_refund: 'pending_invite', transferred: 'pending_invite', reviewing: 'pending_invite', review_requested: 'follow_up_review', review_retry: 'follow_up_review', reviewed: 'reviewed', completed: 'reviewed' };
   const early = ['pending_refund', 'transferred', 'reviewing', 'review_requested', 'review_retry'];
   for (const o of orders) {
-    // ① 订单截图去重
-    if (Array.isArray(o.reviewImages) && o.reviewImages.length !== new Set(o.reviewImages).size) {
-      o.reviewImages = [...new Set(o.reviewImages)]; dedupOrders++;
-    }
+    // ① 订单截图去重（强化版：精确URL + 指纹语义去重）
+    const before = (o.reviewImages || []).length;
+    o.reviewImages = dedupImages(o.reviewImages);
+    if ((o.reviewImages || []).length !== before) dedupOrders++;
     // ② 有截图 → 已评论（仅推进早期状态，不破坏已完成/已放弃）
     if (o.reviewImages && o.reviewImages.length > 0 && early.includes(o.status)) {
       o.status = 'reviewed'; promoted++;
@@ -4151,13 +4175,17 @@ async function repairOrdersData() {
       }
     }
   }
-  // 评论截图去重
+  // 评论截图去重（强化版）
   for (const c of comments) {
-    if (Array.isArray(c.images) && c.images.length !== new Set(c.images).size) {
-      c.images = [...new Set(c.images)]; dedupComments++; await putOne('comments', c);
-    }
+    const before = (c.images || []).length;
+    c.images = dedupImages(c.images);
+    if ((c.images || []).length !== before) { dedupComments++; await putOne('comments', c); }
   }
-  toast(`修复完成：去重订单 ${dedupOrders} 条 / 评论 ${dedupComments} 条，标记已评论 ${promoted} 条，对齐状态 ${synced} 条`, 'success');
+  if (dedupOrders || dedupComments || promoted || synced) {
+    toast(`✅ 数据修复完成：去重订单 ${dedupOrders} 条 / 评论 ${dedupComments} 条，标记已评论 ${promoted} 条，对齐状态 ${synced} 条`, 'success');
+  } else {
+    toast('✅ 数据已全部正常，无需修复', 'info');
+  }
   render(true);
 }
 
@@ -4247,7 +4275,7 @@ async function syncCommentReviewToOrder(comment) {
   if (!ord) return;
   // 回写评论内容类字段
   ord.reviewContent = comment.reviewContent || '';
-  ord.reviewImages = Array.isArray(comment.images) ? [...new Set(comment.images.slice())] : [];
+  ord.reviewImages = Array.isArray(comment.images) ? dedupImages(comment.images.slice()) : [];
   ord.reviewSubmitDate = comment.reviewSubmitDate || null;
   ord.feedback = comment.feedback || '';
     // 回写状态：评论状态 → 订单状态（反向映射）
@@ -5978,6 +6006,15 @@ async function init() {
   await loadSeedData();
   ensureDefaultDropdownCfg();
   migrateComments();
+  // 版本升级自动修复：检测到版本变化时自动修存量数据（图片去重、状态对齐）
+  try {
+    const lastVer = localStorage.getItem('app_last_version') || '';
+    if (lastVer && lastVer !== APP_VERSION) {
+      console.log('[升级] 检测版本变化', lastVer, '→', APP_VERSION, '，执行自动修复…');
+      setTimeout(() => repairOrdersData(), 2000);
+    }
+    localStorage.setItem('app_last_version', APP_VERSION);
+  } catch (e) { /* localStorage 不可用时静默跳过 */ }
   navigate('dashboard');
   // 云端模式：若之前已登录则自动恢复会话并拉取/订阅
   initCloudOnLoad().then(() => { if (typeof render === 'function') render(); }).catch((e) => console.warn('[cloud] 初始化失败', e));
