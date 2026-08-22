@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260821i';
+const APP_VERSION = '20260821j';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -1208,7 +1208,12 @@ function storeForTableKey(key) {
   return 'orders';
 }
 function ddDisplayMap(cfgKey, colKey) {
-  if (colKey === 'status') return Object.fromEntries(Object.entries(STATUS).map(([k, v]) => [k, v.label]));
+  if (colKey === 'status') {
+    const map = Object.fromEntries(Object.entries(STATUS).map(([k, v]) => [k, v.label]));
+    // 兼容旧值显示
+    Object.keys(STATUS_LEGACY_MAP).forEach((oldKey) => { if (!map[oldKey]) map[oldKey] = STATUS[STATUS_LEGACY_MAP[oldKey]]?.label || oldKey; });
+    return map;
+  }
   return null;
 }
 function ddDisplay(map, val) { return map && val != null && map[val] != null ? map[val] : val; }
@@ -1232,6 +1237,13 @@ function ensureDefaultDropdownCfg() {
 }
 function buildDropdownOptions(cfgKey, colKey, cfg, allRows) {
   if (!cfg || !cfg.enabled) return [];
+  // 状态列：始终使用 ORDER_STATUS 8级标准选项，忽略手动配置/自动提取的旧值
+  if (colKey === 'status') {
+    return Object.entries(ORDER_STATUS).map(([k, m], i) => ({
+      value: k,
+      color: m.cls === 'success' ? '#22c55e' : m.cls === 'warning' ? '#f59e0b' : m.cls === 'danger' ? '#ef4444' : m.cls === 'primary' ? '#3b82f6' : m.cls === 'purple' ? '#8b5cf6' : m.cls === 'pink' ? '#ec4899' : m.cls === 'teal' ? '#14b8a6' : null,
+    }));
+  }
   if (cfg.source === 'manual') {
     return (cfg.options || []).map((o, i) => ({ value: o.value, color: cfg.colored ? (o.color || dropdownColor(i)) : null }));
   }
