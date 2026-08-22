@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260822c';
+const APP_VERSION = '20260822d';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -5307,6 +5307,50 @@ function localExtract(text, kind) {
   const isSelf = (addr) => selfEmails.includes(addr.toLowerCase());
 
   // ════════════════════════════════════════
+  // §0  红人数据行解析（仅 kind==='lead'）
+  // ════════════════════════════════════════
+  // 识别格式：名字 国家代码 [粉丝数?] 社媒链接 邮箱
+  // 例：Aussie Reefer Anton AU 1201https://tiktok.com/@xxx xxx@gmail.com
+  //     Ranchoo FR 18 https://tiktok.com/@ranchoo.fr ranchoo.fr@gmail.com
+  if (kind === 'lead') {
+    const CCODES = 'US|UK|DE|AU|CA|FR|IT|ES|JP|BR|MX|IN|KR|TH|VN|PH|SA|AE|NL|BE|CH|AT|SE|NO|DK|FI|PL|PT|GR|IE|NZ|SG|MY|HK|TW|IL|TR|CL|CO|PE|AR|EG|ZA|NG|KE|GH|UG|TZ|ZM';
+    // 模式A: "名字 CC 数字? URL 邮箱"（最常见）
+    const leadPatA = new RegExp(
+      '^([\\w\\u4e00-\\u9fa5][\\w\\s\\u4e00-\\u9fa5.\'-]{1,40}?)\\s+(' + CCODES + ')\\b\\s*(\\d{1,7})?\\s*(https?://\\S+)?\\s*([\\w.+-]+@[\\w.-]+)',
+      'i'
+    );
+    // 模式B: "名字 CC URL 邮箱"（无粉丝数）
+    const leadPatB = new RegExp(
+      '^([\\w\\u4e00-\\u9fa5][\\w\\s\\u4e00-\\u9fa5.\'-]{1,40}?)\\s+(' + CCODES + ')\\b\\s+(https?://\\S+)\\s+([\\w.+-]+@[\\w.-]+)',
+      'i'
+    );
+    const mA = t.match(leadPatA);
+    const mB = (!mA) ? t.match(leadPatB) : null;
+    const m = mA || mB;
+    if (m) {
+      // 昵称：取名字部分（去掉末尾空格/竖线等杂字符）
+      let rawName = (m[1] || '').trim().replace(/[\s|]+$/, '');
+      if (rawName) out.nickname = rawName;
+      // 国家：2字母代码转大写
+      if (m[2]) { const cmap = { us:'US',uk:'UK',de:'DE',au:'AU',ca:'CA',fr:'FR',it:'IT',es:'ES',jp:'JP' }; out.country = (cmap[m[2].toLowerCase()] || m[2].toUpperCase()); }
+      // 主页链接
+      const urlMatch = m[4] || m[3]; // mA中url在m[4], mB中url在m[3]
+      if (urlMatch) { let u = urlMatch.trim(); if (u.endsWith('.')) u = u.slice(0,-1); out.profileUrl = u; }
+      // 平台：从链接域名推断
+      if (out.profileUrl) {
+        if (/tiktok\.com/i.test(out.profileUrl)) out.platform = 'TikTok';
+        else if (/instagram\.com/i.test(out.profileUrl)) out.platform = 'Instagram';
+        else if (/youtube\.com|youtu\.be/i.test(out.profileUrl)) out.platform = 'YouTube';
+        else if (/facebook\.com/i.test(out.profileUrl)) out.platform = 'Facebook';
+      }
+      // 邮箱
+      const emailMatch = m[5] || m[4]; // mA中email在m[5], mB中email在m[4]
+      if (emailMatch) out.email = emailMatch.trim().toLowerCase();
+      // 粉丝数暂不存（未来可加 followers 字段）
+    }
+  }
+
+  // ════════════════════════════════════════
   // §1  邮件结构解析（From/To/Subject/时间线）
   // ════════════════════════════════════════
   // 支持中英文邮件头：From / 发件人 / To / 收件人 / Subject / 主题
@@ -5407,9 +5451,23 @@ function localExtract(text, kind) {
   if (customerName) {
     if (kind === 'lead') out.nickname = customerName;
     else out.customerName = customerName;
-  } else if (kind === 'lead' && customerEmail) {
-    const at = customerEmail.match(/@([\w.]{3,30})/);
-    if (at) out.nickname = at[1];
+  } else if (kind === 'lead') {
+    // 兜底：优先从社媒链接提取 handle，其次才用邮箱用户名（不用域名！）
+    let fallbackNick = '';
+    // A: 从 TikTok/Instagram URL 提取 @handle
+    const handleM = t.match(/tiktok\.com\/@([\w.-]{1,50})/i) || t.match(/instagram\.com\/([\w.]{1,50})(?:\/|\s|$)/i);
+    if (handleM) fallbackNick = handleM[1];
+    // B: 从邮箱提取用户名部分（@左边）
+    else if (customerEmail) {
+      const localPart = customerEmail.match(/^([\w.+-]{1,30})@/);
+      if (localPart) fallbackNick = localPart[1];
+    }
+    // C: 取文本第一个单词
+    if (!fallbackNick) {
+      const firstWord = t.match(/^[\s]*([\w\u4e00-\u9fa5]{1,30})/i);
+      if (firstWord) fallbackNick = firstWord[1];
+    }
+    if (fallbackNick && !out.nickname) out.nickname = fallbackNick;
   }
 
   // ════════════════════════════════════════
@@ -5454,8 +5512,13 @@ function localExtract(text, kind) {
   // ════════════════════════════════════════
   // §7  国家（Subject > 正文 > 默认）
   // ════════════════════════════════════════
-  let country = subjCountry;
+  let country = subjCountry || out.country; // §0 可能已经提取了（优先级最高）
   if (!country) {
+    // 红人数据：独立2字母国家代码（名字和数字/URL之间）
+    if (kind === 'lead') {
+      const standAloneCC = t.match(/(?:^|\s)(US|UK|DE|AU|CA|FR|IT|ES|JP|BR|MX|IN|KR|TH|VN|PH|SA|AE|NL|BE|CH|AT|SE|NO|DK|FI|PL|PT|GR|IE|NZ|SG|MY|HK|TW|IL|TR|CL|CO|PE|AR|EG|ZA|NG|KE|GH|UG|TZ|ZM)\b(?=\s|\d|https?:|$)/i);
+      if (standAloneCC) { const cm3 = { us:'US',uk:'UK',de:'DE',au:'AU',ca:'CA',fr:'FR',it:'IT',es:'ES',jp:'JP',br:'BR',mx:'MX',in:'IN',kr:'KR',th:'TH',vn:'VN',ph:'PH',sa:'SA',ae:'AE',nl:'NL',be:'BE',ch:'CH',at:'AT',se:'SE',no:'NO',dk:'DK',fi:'FI',pl:'PL',pt:'PT',gr:'GR',ie:'IE',nz:'NZ',sg:'SG',my:'MY',hk:'HK',tw:'TW',il:'IL',tr:'TR',cl:'CL',co:'CO',pe:'PE',ar:'AR',eg:'EG',za:'ZA',ng:'NG',ke:'KE',gh:'GH',ug:'UG',tz:'TZ',zm:'ZM' }; country = cm3[standAloneCC[1].toLowerCase()] || standAloneCC[1].toUpperCase(); }
+    }
     // 用更严格的上下文匹配国家全称（避免 "I'd" → IT 这类误匹配）
     const ctryPatterns = [
       [/\bUnited States\b/i, 'US'], [/\bUSA\b(?!P)/i, 'US'],
@@ -5638,12 +5701,12 @@ async function callAIExtract(text, kind) {
   const sys = `You are a data extraction assistant for an aquarium influencer/order management system. The user pastes a chat/email thread with a customer or influencer. Extract structured fields and return ONLY valid JSON: {"fields":{...},"summary":"key points in Chinese"}.
 
 CRITICAL RULES (follow strictly):
-1. OPERATOR SELF-EMAILS (NEVER use as customer email): ${selfEmails}. These belong to Anna at IBAY Aqua. Customer = the OTHER person.
+1. OPERATOR SELF-EMAILS (NEVER use as customer/email): ${selfEmails}. These belong to Anna at IBAY Aqua.
 2. "customerEmail"/"email": Use "From:" header email (the person who wrote/replied). NEVER operator's own email.
 3. "orderNumber": Must be actual Amazon order # (digits+dashes like 111-8333069-5627461). NEVER extract English words like "number".
 4. "customerName": From "From:" name, or last email signature ("Best regards, XXX"). Skip Anna/IBAY.
 5. "product": From numbered list item, Amazon link context, or Subject line after "|". E.g., "3W Internal Aquarium Filter".
-6. "country": From email Subject line FIRST (e.g., "UK Product Testing Campaign" → UK). Then body text. Avoid false matches like "I'd" → IT.
+6. "country": From 2-letter code in text (AU/FR/IT/ES/DE/UK/US etc.) or Subject line ("UK Product Testing Campaign" → UK). Avoid false matches like "I'd" → IT.
 7. "store": Infer from country as "HS-{country}" if not explicitly mentioned.
 8. "refundMethod" — MULTI-SIGNAL DETECTION:
    - PayPal signals: "I'd go with PayPal", "PayPal option", "PayPal would be convenient", "my PayPal", "received payment"+PayPal mentioned
@@ -5656,6 +5719,15 @@ CRITICAL RULES (follow strictly):
    - "received the item/package" → transferred
    - Has order# but no receipt yet → pending_refund
 10. "socialMediaUrl"/"profileUrl": Skip ALL e-commerce URLs (amazon, amzn, ebay, aliexpress, temu, shein). Only real social profile links.
+
+LEAD-SPECIFIC RULES (when kind=lead/influencer):
+11. Input may be a STRUCTURED LINE: "Name COUNTRY_CODE [followers] SOCIAL_URL Email"
+    Example: "Aussie Reefer Anton AU 1201https://www.tiktok.com/@aussie.reefer.anton smithanton787@gmail.com"
+    Example: "Ranchoo FR 18 https://www.tiktok.com/@ranchoo.fr ranchoo.fr@gmail.com"
+12. "nickname" = The NAME portion (e.g., "Aussie Reefer Anton", "Ranchoo", "IL SUSSURRO DELL'ACQUA"). NEVER use email domain (gmail.com/hotmail.com) as nickname!
+13. "country" = The 2-letter country code (AU/FR/IT/ES/DE/UK/US...). Extract it even if standalone between name and URL.
+14. "platform" = Infer from URL domain: tiktok.com→TikTok, instagram.com→Instagram, youtube.com→YouTube, facebook.com→Facebook.
+15. "profileUrl" = Full social media URL. "email" = Full email address.
 
 Field names when present: ${fieldList.join(', ')}.
 - Missing fields => empty string "".
