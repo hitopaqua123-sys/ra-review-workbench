@@ -204,7 +204,7 @@ a.link:hover{text-decoration:underline}
 .bi-check{display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;user-select:none}
 .bi-copy-btns{display:flex;gap:10px;flex-wrap:wrap}
 .bi-copy-btns .btn{flex:1;min-width:140px}
-.kv{display:grid;grid-template-columns:120px 1fr;gap:10px 14px;font-size:13px;align-items:start}
+.kv{display:grid;grid-template-columns:100px 1fr;gap:4px 10px;font-size:13px;align-items:start}
 .kv dt{color:var(--muted);font-weight:600;padding-top:5px}
 .kv dd{word-break:break-word}
 .editable{cursor:text;padding:5px 8px;margin:-5px -8px;border-radius:10px;border:1px dashed transparent;transition:all .15s;min-height:1.2em}
@@ -279,7 +279,7 @@ a.link:hover{text-decoration:underline}
 .float-head .x-btn{background:transparent;border:none;font-size:20px;color:var(--muted);line-height:1;cursor:pointer;padding:4px 8px}
 .float-head .x-btn:hover{color:var(--foreground)}
 .float-body{padding:16px 18px;overflow:auto;flex:1;font-size:13px}
-.float-body .kv{grid-template-columns:100px 1fr;gap:8px 12px}
+.float-body .kv{grid-template-columns:90px 1fr;gap:3px 8px}
 .float-body .section-h{font-size:12px;font-weight:800;margin:14px 0 6px}
 .float-body table.data{font-size:12px}
 .float-body table.data th,.float-body table.data td{padding:7px 10px}
