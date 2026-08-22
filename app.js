@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260821j';
+const APP_VERSION = '20260822a';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -95,7 +95,7 @@ function restoreFocus(snap) {
 
 /* ---------- status / currency config ---------- */
 /* 订单状态机（与红人跟进状态对齐，覆盖完整订单生命周期）
-   流程: 待返款→已转账→测评中→索要好评→(失败)再次索评→已留评→已完成
+   流程: 待返款→已转账→测评中→索要好评→(失败)再次索评→已评论→已完成
    任意阶段可→放弃；已完成/放弃为终止态
  */
 const ORDER_STATUS = {
@@ -104,7 +104,7 @@ const ORDER_STATUS = {
   reviewing:         { label: '测评中',       cls: 'info',     sortKey: 3 },
   review_requested:  { label: '索要好评',     cls: 'warning',  sortKey: 4 },
   review_retry:      { label: '再次索评',     cls: 'danger',   sortKey: 5 },
-  reviewed:          { label: '已留评',       cls: 'success',  sortKey: 6 },
+  reviewed:          { label: '已评论',       cls: 'success',  sortKey: 6 },
   completed:         { label: '已完成',       cls: 'success',  sortKey: 7 },
   abandoned:         { label: '放弃',         cls: 'muted',    sortKey: 99 },
 };
@@ -113,7 +113,7 @@ const STATUS = ORDER_STATUS;
 // 旧数据值 → 新值映射（确保旧数据也能正确显示）
 const STATUS_LEGACY_MAP = {
   refunded: 'transferred',       // 旧"已返款" → 新"已转账"
-  reviewed: 'reviewed',           // 已评价 → 已留评（同名）
+  reviewed: 'reviewed',           // 已评价/已留评 → 已评论（同名）
   pending_refund: 'pending_refund', // 待返款（不变）
 };
 const normOrderStatus = (s) => {
@@ -739,6 +739,18 @@ async function bindImagesEdit(root, rec, store, field = 'reviewImages', onChange
       const dataUrl = await new Promise((res) => { const r = new FileReader(); r.onload = (ev) => res(ev.target.result); r.readAsDataURL(file); });
       if (!rec[field]) rec[field] = [];
       if (!rec[field].includes(dataUrl)) rec[field].push(dataUrl);
+    }
+    // 去重：防止粘贴重复图片
+    if (rec[field] && rec[field].length !== new Set(rec[field]).size) {
+      rec[field] = [...new Set(rec[field])];
+    }
+    // 自动推进状态：订单有评价截图时，自动将状态提升为「已评论」
+    if (field === 'reviewImages' && store === 'orders' && rec[field] && rec[field].length > 0) {
+      const earlyStatuses = ['pending_refund', 'transferred', 'reviewing', 'review_requested', 'review_retry'];
+      if (earlyStatuses.includes(rec.status)) {
+        rec.status = 'reviewed';
+        toast('已自动将订单状态更新为「已评论」', 'info');
+      }
     }
     await putOne(store, rec);
     toast(`已粘贴 ${items.length} 张图片`, 'success');
@@ -2879,7 +2891,7 @@ async function openOrderForm(id, prefill = null) {
       // 跨模块联动：订单评论字段 -> 客户评论管理（按订单号同步/新建）
       await syncOrderReviewToComments(rec);
       renderCustomersIfVisible(true);
-      m.close(); toast(isEdit ? '已更新' : '已新增', 'success'); render();
+      m.close(); toast(isEdit ? '已更新' : '已新增', 'success'); render(true);
     } catch (err) {
       console.error('保存订单失败:', err);
       toast('保存失败：' + (err && err.message ? err.message : err), 'danger');
@@ -2981,7 +2993,7 @@ async function openOrderDetail(id) {
         $('#d-view-lead', panel).addEventListener('click', () => { close(); navigate('outreach'); setTimeout(() => { const lead = document.querySelector(`[data-lid="${o.linkedLeadId}"]`); if (lead) lead.click(); }, 200); });
       }
       $('#d-setstatus', panel).addEventListener('click', async () => {
-        o.status = $('#d-status', panel).value; await putOne('orders', o); await recomputeCustomerStatsForOrder(o); renderCustomersIfVisible(true); close(); toast('状态已更新', 'success'); render();
+        o.status = $('#d-status', panel).value; await putOne('orders', o); await recomputeCustomerStatsForOrder(o); renderCustomersIfVisible(true); close(); toast('状态已更新', 'success'); render(true);
       });
       $('#d-del', panel).addEventListener('click', () => { close(); deleteOrder(id); });
       $('#d-view-comments', panel).addEventListener('click', () => { close(); state.comments.kw = o.orderNumber || ''; navigate('comments'); });
@@ -3008,7 +3020,7 @@ async function deleteOrder(id) {
   await delOne('orders', id);
   if (o) await recomputeCustomerStatsForOrder(o);
   renderCustomersIfVisible(true);
-  toast(linkedComments.length ? `已删除订单，${linkedComments.length} 条评论已同步更新` : '已删除', 'success'); render();
+  toast(linkedComments.length ? `已删除订单，${linkedComments.length} 条评论已同步更新` : '已删除', 'success'); render(true);
 }
 async function batchDeleteOrders() {
   const ids = [...state.orders.sel];
@@ -3135,7 +3147,7 @@ const REVIEW_STATUS = {
   published: { label: '已发布', cls: 'primary' },
   pending_supplement: { label: '待补差价', cls: 'warning' },
   follow_up_review: { label: '追加评价', cls: 'info' },
-  reviewed: { label: '已评价', cls: 'success' },
+  reviewed: { label: '已评论', cls: 'success' },
 };
 
 async function fetchComments() {
@@ -3214,7 +3226,7 @@ async function renderComments(c, keepScroll = false) {
         <button class="btn btn-sm btn-danger" id="cm-batch">🗑 批量删除 (<span id="cm-batch-n">0</span>)</button>
         <button class="btn btn-sm" id="cm-cols" title="列设置">⚙ 列设置</button>
         <button class="btn btn-primary btn-sm" id="cm-add">+ 新增评论</button>
-        <button class="btn btn-sm" id="cm-repair" style="border:1px solid #f59e0b;color:#b45309;background:#fffbeb" title="扫描所有「已留评」订单：评论管理中无记录的自动补建、订单详情评论 tab 为空的自动补全">🔧 补建缺失评论</button>
+        <button class="btn btn-sm" id="cm-repair" style="border:1px solid #f59e0b;color:#b45309;background:#fffbeb" title="扫描所有「已评论」订单：评论管理中无记录的自动补建、订单详情评论 tab 为空的自动补全">🔧 补建缺失评论</button>
       </div>
       ${filterTagsHtml('comments')}
       <div class="table-wrap"><table class="data sticky-first-col" data-table="comments"><thead><tr>
@@ -3252,7 +3264,8 @@ async function renderComments(c, keepScroll = false) {
             }
             else if (col.key === 'sourceTag') v = `<td><span class="tag">${esc(x.sourceTag) || '—'}</span></td>`;
             else if (col.key === 'reviewStatus') {
-              const st = REVIEW_STATUS[x.reviewStatus] || REVIEW_STATUS.pending_invite;
+              const normed = normReviewStatus(x.reviewStatus);
+              const st = REVIEW_STATUS[normed] || REVIEW_STATUS.pending_invite;
               v = `<td><span class="badge badge-${st.cls}">${st.label}</span></td>`;
             }
             else if (col.key === 'reviewSubmitDate') v = `<td class="cell-ellipsis">${x.reviewSubmitDate ? fmtDate(x.reviewSubmitDate) : '—'}</td>`;
@@ -3283,7 +3296,7 @@ async function renderComments(c, keepScroll = false) {
   $('#cm-cols').addEventListener('click', () => openColumnSettings('comments', () => renderComments(c, true)));
   $('#cm-add').addEventListener('click', () => openCommentForm(null));
   $('#cm-repair').addEventListener('click', async () => {
-    if (!confirm('将扫描所有「状态=已留评」的订单：\n• 评论管理中无对应记录的，自动补建到评论管理\n• 订单详情「评论管理」tab 为空的，自动补全\n\n是否继续？')) return;
+    if (!confirm('将扫描所有「状态=已评论」的订单：\n• 评论管理中无对应记录的，自动补建到评论管理\n• 订单详情「评论管理」tab 为空的，自动补全\n\n是否继续？')) return;
     await repairMissingComments();
   });
 
@@ -3755,7 +3768,7 @@ function normStatus(v) {
   if (['reviewing', '测评中', '测试中', '测评', '已收货'].includes(s)) return 'reviewing';
   if (['review_requested', '索要好评', '索评', '待评价'].includes(s)) return 'review_requested';
   if (['review_retry', '再次索评', '再次索要好评', '二次索评'].includes(s)) return 'review_retry';
-  if (['reviewed', '已留评', '已评价', '已评', '留评'].includes(s)) return 'reviewed';
+  if (['reviewed', '已评论', '已留评', '已评价', '已评', '留评'].includes(s)) return 'reviewed';
   if (['completed', '已完成', '完成', '已结束'].includes(s)) return 'completed';
   if (['abandoned', '放弃', '取消'].includes(s)) return 'abandoned';
   // 向后兼容旧状态名
@@ -3768,9 +3781,10 @@ function normReviewStatus(v) {
   if (['published', '已发布', '发布'].includes(s)) return 'published';
   if (['pending_supplement', '待补差价', '补差价'].includes(s)) return 'pending_supplement';
   if (['follow_up_review', '追加评价', '追加'].includes(s)) return 'follow_up_review';
-  if (['reviewed', '已评价', '已评'].includes(s)) return 'reviewed';
+  if (['reviewed', '已评论', '已评价', '已评'].includes(s)) return 'reviewed';
   if (['review_lost', '评价丢失', '丢失'].includes(s)) return 'reviewed'; // 兼容旧值
   if (['declined', '拒绝评价', '拒绝'].includes(s)) return 'pending_invite'; // 兼容旧值
+  if (['待回访', 'pending_revisit', '回访'].includes(s)) return 'follow_up_review'; // 兼容旧数据「待回访」→ 追加评价
   return 'pending_invite';
 }
 function pick(row, field) {
@@ -4036,7 +4050,7 @@ async function syncOrderReviewToComments(order) {
     // 更新最近一条关联评论：同步所有关键字段（不仅是评论字段）
     const target = matched[0];
     target.reviewContent = order.reviewContent || '';
-    target.images = Array.isArray(order.reviewImages) ? order.reviewImages.slice() : [];
+    target.images = Array.isArray(order.reviewImages) ? [...new Set(order.reviewImages.slice())] : [];
     target.reviewSubmitDate = order.reviewSubmitDate || null;
     target.feedback = order.feedback || '';
     // 同步客户/产品/店铺/状态等全部可变字段
@@ -4103,7 +4117,7 @@ async function syncOrderReviewToComments(order) {
   await putOne('orders', order);
 }
 
-// 一键补建：扫描所有「状态=已留评」的订单，把缺失的评论记录补建到评论管理，
+// 一键补建：扫描所有「状态=已评论」的订单，把缺失的评论记录补建到评论管理，
 // 并把订单详情「评论管理」tab 内嵌评论为空的补全（双向数据一致，修复历史断层）
 async function repairMissingComments() {
   const orders = await getAll('orders');
@@ -4189,14 +4203,14 @@ async function syncCommentReviewToOrder(comment) {
   if (!ord) return;
   // 回写评论内容类字段
   ord.reviewContent = comment.reviewContent || '';
-  ord.reviewImages = Array.isArray(comment.images) ? comment.images.slice() : [];
+  ord.reviewImages = Array.isArray(comment.images) ? [...new Set(comment.images.slice())] : [];
   ord.reviewSubmitDate = comment.reviewSubmitDate || null;
   ord.feedback = comment.feedback || '';
-  // 回写状态：评论状态 → 订单状态（反向映射）
-  if (comment.reviewStatus) {
-    const revStatusMap = { pending_invite: 'pending_refund', published: 'reviewed', reviewed: 'reviewed', pending_supplement: 'pending_refund', follow_up_review: 'review_requested' };
-    ord.status = revStatusMap[comment.reviewStatus] || ord.status;
-  }
+    // 回写状态：评论状态 → 订单状态（反向映射）
+    if (comment.reviewStatus) {
+      const revStatusMap = { pending_invite: 'pending_refund', published: 'reviewed', reviewed: 'reviewed', pending_supplement: 'pending_refund', follow_up_review: 'review_retry', review_lost: 'reviewed', declined: 'pending_refund' };
+      ord.status = revStatusMap[comment.reviewStatus] || ord.status;
+    }
   // 回写客户/产品/店铺等可变信息（评论端修改了也要同步到订单）
   if (comment.customerName != null) ord.customerName = comment.customerName;
   if (comment.customerEmail != null) ord.customerEmail = comment.customerEmail;
@@ -4710,8 +4724,8 @@ async function loadSeedData() {
 
 /* ============================================================
    红人跟进 · Outreach Module (v20260820p)
-   状态机: 待开发→已联系→意向确认→指导下单&退款→已转账→索要好评→(失败)再次索要好评→(成功)已留评
-   意向确认与指导下单&退款均可→放弃；已留评/放弃为终止态
+   状态机: 待开发→已联系→意向确认→指导下单&退款→已转账→索要好评→(失败)再次索要好评→(成功)已评论
+   意向确认与指导下单&退款均可→放弃；已评论/放弃为终止态
    ============================================================ */
 
 const OUTREACH_STATUS = {
@@ -4722,7 +4736,7 @@ const OUTREACH_STATUS = {
   paid:             { label: '已转账',       cls: 'primary',  nextAction: '跟进使用体验', defaultDays: 7 },
   review_requested: { label: '索要好评',     cls: 'warning',  nextAction: '索评',         defaultDays: 10 },
   review_retry:     { label: '再次索要好评', cls: 'warning',  nextAction: '二次索评',     defaultDays: 5 },
-  reviewed:         { label: '已留评',       cls: 'success',  nextAction: null,            defaultDays: null },
+  reviewed:         { label: '已评论',       cls: 'success',  nextAction: null,            defaultDays: null },
   abandoned:        { label: '放弃',         cls: 'muted',    nextAction: null,            defaultDays: null },
 };
 
@@ -5483,8 +5497,8 @@ function localExtract(text, kind) {
   // §12  状态智能推断（从内容语义判断当前阶段）
   // ════════════════════════════════════════
   if (kind === 'order') {
-    // 已留评信号
-    // 已留评信号（允许 has [now/already] been 等变体）
+    // 已评论信号
+    // 已评论信号（允许 has [now/already] been 等变体）
     if (/(?:review has(?:\s+\w+)?\s*been (?:posted|submitted|published|uploaded)|already posted (?:a |my )?review|left (?:a )?review|written (?:a )?review|review is (?:up|live|posted)|my review has (?:now )?been posted)/i.test(t)) {
       out.status = 'completed';
     }
