@@ -15,7 +15,7 @@ const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
 const fmtDate = (s) => (s ? String(s).slice(0, 10) : '—');
 
 /* ---------- 真实运行版本号（用于侧边栏徽标，便于排查缓存） ---------- */
-const APP_VERSION = '20260822a';
+const APP_VERSION = '20260822b';
 
 /* ---------- force horizontal scroll on all tables ---------- */
 function forceTableScroll(root = document) {
@@ -2571,6 +2571,7 @@ async function renderOrders(c, keepScroll = false) {
       <button class="btn btn-sm" id="o-excel-in">⭱ 导入Excel</button>
       <button class="btn btn-sm btn-danger" id="o-batch">🗑 批量删除 (<span id="o-batch-n">0</span>)</button>
       <button class="btn btn-sm" id="o-cols" title="列设置（显示/隐藏/下拉配置）">⚙ 列设置</button>
+      <button class="btn btn-sm" id="o-repair" style="border:1px solid #f59e0b;color:#b45309;background:#fffbeb" title="修复已有数据：① 订单/评论重复截图去重 ② 有评价截图的订单自动标记「已评论」 ③ 按订单状态对齐评论状态">🔧 修复数据</button>
       <button class="btn btn-sm" id="o-ai">🤖 AI录入</button>
       <button class="btn btn-primary btn-sm" id="o-add">+ 新增订单</button>
     </div>
@@ -2650,6 +2651,7 @@ async function renderOrders(c, keepScroll = false) {
   $('#o-excel-out').addEventListener('click', () => exportOrdersExcel());
   $('#o-excel-in').addEventListener('click', () => importOrdersExcel());
   $('#o-batch').addEventListener('click', batchDeleteOrders);
+  $('#o-repair').addEventListener('click', repairOrdersData);
   const updateOrdBatchUI = () => {
     const n = state.orders.sel.length;
     const bn = $('#o-batch-n'); if (bn) bn.textContent = n;
@@ -4115,6 +4117,48 @@ async function syncOrderReviewToComments(order) {
   if (!Array.isArray(order.comments)) order.comments = [];
   order.comments.push({ id: recData.id, content: recData.reviewContent, images: recData.images, submitDate: recData.reviewSubmitDate, source: 'order_sync' });
   await putOne('orders', order);
+}
+
+// 一键修复已有订单/评论数据（针对历史存量数据，新写入已由各路径保证）：
+// ① 订单 reviewImages 与评论 images 重复截图去重
+// ② 有评价截图的订单自动标记为「已评论」
+// ③ 按订单状态为准，把关联评论的 reviewStatus 对齐（解决订单与评论状态不一致）
+async function repairOrdersData() {
+  if (!confirm('将执行一次性数据修复（仅处理已有历史数据）：\n\n1. 所有订单/评论的重复截图自动去重\n2. 有评价截图的订单自动标记为「已评论」\n3. 按「订单状态为准」对齐评论状态（待回访/已评论等）\n\n是否继续？')) return;
+  const orders = await getAll('orders');
+  const comments = await getAll('comments');
+  let dedupOrders = 0, dedupComments = 0, promoted = 0, synced = 0;
+  // 订单状态 → 评论状态 映射（与 syncOrderReviewToComments 保持一致）
+  const statusMap = { pending_refund: 'pending_invite', transferred: 'pending_invite', reviewing: 'pending_invite', review_requested: 'follow_up_review', review_retry: 'follow_up_review', reviewed: 'reviewed', completed: 'reviewed' };
+  const early = ['pending_refund', 'transferred', 'reviewing', 'review_requested', 'review_retry'];
+  for (const o of orders) {
+    // ① 订单截图去重
+    if (Array.isArray(o.reviewImages) && o.reviewImages.length !== new Set(o.reviewImages).size) {
+      o.reviewImages = [...new Set(o.reviewImages)]; dedupOrders++;
+    }
+    // ② 有截图 → 已评论（仅推进早期状态，不破坏已完成/已放弃）
+    if (o.reviewImages && o.reviewImages.length > 0 && early.includes(o.status)) {
+      o.status = 'reviewed'; promoted++;
+    }
+    await putOne('orders', o);
+    // ③ 关联评论状态对齐（订单为准）
+    const onum = String(o.orderNumber || '').trim().toLowerCase();
+    if (onum) {
+      const matched = comments.filter((c) => c.orderNumber && String(c.orderNumber).trim().toLowerCase() === onum);
+      const want = statusMap[o.status] || (matched[0] && matched[0].reviewStatus) || 'pending_invite';
+      for (const c of matched) {
+        if (c.reviewStatus !== want) { c.reviewStatus = want; synced++; await putOne('comments', c); }
+      }
+    }
+  }
+  // 评论截图去重
+  for (const c of comments) {
+    if (Array.isArray(c.images) && c.images.length !== new Set(c.images).size) {
+      c.images = [...new Set(c.images)]; dedupComments++; await putOne('comments', c);
+    }
+  }
+  toast(`修复完成：去重订单 ${dedupOrders} 条 / 评论 ${dedupComments} 条，标记已评论 ${promoted} 条，对齐状态 ${synced} 条`, 'success');
+  render(true);
 }
 
 // 一键补建：扫描所有「状态=已评论」的订单，把缺失的评论记录补建到评论管理，
